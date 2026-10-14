@@ -1,0 +1,2107 @@
+# -*- coding: utf-8 -*-
+"""HSLegendArriver Web 控制台（零依赖后端）。
+
+仅使用 Python 标准库：本地 HTTP 服务 + 自动化线程管理 + 定时调度 + 实时日志。
+前端页面位于 web/index.html，启动后自动在浏览器打开。
+
+用法:
+    python web_ui.py [--no-browser]
+
+功能:
+    * 页面配置用户 ID 与炉石日志目录（写入 constants 并持久化到 ui_config.json）
+    * 定时任务：开始时间不能早于当前时间；到达结束时间后，
+      先等本局对战打完（状态机回到非对局状态）再自动终止自动化
+    * 「开始对战」按钮立即启动，「本局结束后停止」「立即停止」手动控制
+    * Ctrl+Q 全局热键立即停止
+"""
+from __future__ import annotations
+
+import ctypes
+try:
+    import log_overlay
+except Exception as exc:
+    print(f"[overlay] 导入日志浮窗失败(已禁用): {type(exc).__name__}: {exc}")
+    log_overlay = None
+if log_overlay is not None:
+    # 浮窗内部异常（tkinter 不可用、Tk 初始化失败……）也写进网页日志：
+    # 否则"点了没反应"，用户和反馈都看不到原因。
+    try:
+        log_overlay.set_logger(lambda text: _log("WARN", text))
+    except Exception:
+        pass
+import json
+import os
+import subprocess
+import sys
+import threading
+import time
+import traceback
+import webbrowser
+from collections import deque
+from datetime import datetime
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from pathlib import Path
+from urllib.parse import parse_qs, urlparse
+
+# 脚本自己的日志文件：统计体积 / 打开位置 / 一键清理（纯函数在 script_logs.py）。
+import script_logs
+
+ROOT = Path(__file__).resolve().parent
+# 对战日志目录与运行日志路径（日志浮窗的「日志」行、「打开日志/清理日志」都用它）。
+LOG_DIR = script_logs.LOG_DIR
+RUNTIME_LOG = script_logs.RUNTIME_LOG
+WEB_DIR = ROOT / "web"
+CONFIG_PATH = ROOT / "ui_config.json"
+# 站点/端口/日志缓冲来自 config.py（可通过环境变量覆盖，见 HS_HOST/HS_PORT/HS_LOG_BUFFER_SIZE）。
+from config import (
+    DEFAULT_AUTO_CONCEDE, DEFAULT_HUMAN_LIKE, DEFAULT_LIVENESS,
+    DEFAULT_RANK_STOP, HOST,
+    BASE_PORT, LOG_BUFFER_SIZE, STRATEGY_CHOICES, _USER_DELAY_KEYS,
+    RecommendationConfig, save_strategy_setting, strategy_label,
+    strategy_options, strategy_setting)
+# 环境自检（Python 3.12 / 依赖包 / 分辨率缩放）与原样截图区域框预览。
+import screen_regions
+import selfcheck
+
+
+# ---------------------------------------------------------------- 管理员检测
+def _is_admin() -> bool:
+    try:
+        return bool(ctypes.windll.shell32.IsUserAnAdmin())
+    except Exception:
+        return False
+
+
+IS_ADMIN = _is_admin()
+
+
+# ---------------------------------------------------------------- 配置持久化
+DEFAULT_CONFIG = {
+    "name": "",
+    "log_root": "",
+    "schedule_start": None,
+    "schedule_end": None,
+    "auto_concede": dict(DEFAULT_AUTO_CONCEDE),
+    "liveness": dict(DEFAULT_LIVENESS),
+    "rank_stop": dict(DEFAULT_RANK_STOP),
+}
+
+
+def load_config() -> dict:
+    try:
+        data = json.loads(CONFIG_PATH.read_text(encoding="utf8"))
+        if not isinstance(data, dict):
+            return dict(DEFAULT_CONFIG)
+        return {**DEFAULT_CONFIG, **data}
+    except Exception:
+        return dict(DEFAULT_CONFIG)
+
+
+def save_config(cfg: dict):
+    try:
+        CONFIG_PATH.write_text(
+            json.dumps(cfg, ensure_ascii=False, indent=2), encoding="utf8")
+    except Exception as exc:
+        _log("WARN", f"配置保存失败：{exc}")
+
+
+# ---------------------------------------------------------------- 运行日志缓冲
+_log_seq = 0
+_log_buffer = deque(maxlen=LOG_BUFFER_SIZE)
+_log_lock = threading.Lock()
+
+# 运行日志的自动裁剪：文件超过 LOG_TRIM_BYTES 就只留最后 LOG_TRIM_KEEP_LINES 行。
+# 老实现是"每次写日志都判断、超了就整文件读一遍再重写"——文件一旦涨到几十 MB，
+# 每次 _log 都要读 50MB+，而且多线程并发重写还会互相打断，结果是**只涨不裁**
+# （本机实测：ui_log_last.txt 涨到 56MB）。现在：热路径只比一次时间戳，最多
+# 每 LOG_TRIM_MIN_INTERVAL 秒才真裁一次，并且只读文件尾部 + 原子替换。
+LOG_TRIM_BYTES = 2 * 1024 * 1024
+LOG_TRIM_KEEP_LINES = 800
+LOG_TRIM_MIN_INTERVAL = 60.0
+LOG_TRIM_KEEP_BYTES = 512 * 1024        # 只读尾部这么多字节，足够 800 行
+_log_trim_lock = threading.Lock()
+_log_trim_at = [0.0]
+
+
+def _trim_runtime_log(path, now: float) -> bool:
+    """把运行日志裁到最后 LOG_TRIM_KEEP_LINES 行（原子替换，返回是否裁了）。
+
+    调用前必须确认已经过了节流间隔；失败一律静默（日志写不进去不该影响主流程）。
+    """
+    try:
+        if path.stat().st_size <= LOG_TRIM_BYTES:
+            return False
+    except OSError:
+        return False
+    with _log_trim_lock:
+        try:
+            size = path.stat().st_size
+            if size <= LOG_TRIM_BYTES:
+                return False
+            with open(path, "rb") as f:
+                if size > LOG_TRIM_KEEP_BYTES:
+                    f.seek(-LOG_TRIM_KEEP_BYTES, os.SEEK_END)
+                tail = f.read()
+            lines = tail.decode("utf-8", errors="replace").splitlines(
+                keepends=True)[-LOG_TRIM_KEEP_LINES:]
+            tmp = path.with_suffix(path.suffix + ".tmp")
+            with open(tmp, "w", encoding="utf-8") as f:
+                f.write("".join(lines))
+            os.replace(tmp, path)          # 原子替换：读者不会看到半个文件
+            _log_trim_at[0] = now
+            return True
+        except OSError:
+            return False
+
+
+def _log(level: str, msg: str):
+    global _log_seq
+    with _log_lock:
+        _log_seq += 1
+        _log_buffer.append({
+            "seq": _log_seq,
+            "t": datetime.now().strftime("%H:%M:%S"),
+            "level": level,
+            "msg": str(msg),
+        })
+    # 统一推入日志浮窗（关键行），与自动化日志同通道、按时间先后。
+    # 浮窗若出现异常绝不能让日志系统把主流程一起拖垮。
+    if log_overlay is not None and _overlay_key(str(msg)):
+        try:
+            log_overlay.push(str(msg), level)
+        except Exception:
+            pass
+    # 同时落盘：程序关闭/异常退出后仍可离线查看（诊断不依赖人工复制）。
+    try:
+        path = RUNTIME_LOG
+        with open(path, "a", encoding="utf-8") as f:
+            f.write(f"{datetime.now().strftime('%Y-%m-%d %H:%M:%S')} "
+                    f"[{level}] {msg}\n")
+        now = time.time()
+        if now - _log_trim_at[0] >= LOG_TRIM_MIN_INTERVAL:
+            _trim_runtime_log(path, now)
+    except Exception:
+        pass
+
+
+def _overlay_key(line: str) -> bool:
+    keys = ("回合", "延时", "轮到己方", "等待", "[推荐]", "[执行]",
+            "识别换牌", "换牌", "留牌", "阶段", "对局结束", "未对局",
+            "本局结束", "失败", "立即停止",
+            # 上分停止条件（每局结束读段位）也要能看到检测结果
+            "段位", "上分",
+            # 浮窗上的「打开日志 / 清理日志」结果要能看见
+            "日志",
+            # 存活检测 / 昵称校验的告警必须进浮窗（issue 反馈看不到就白做）
+            "炉石", "昵称", "用户 ID")
+    return ("[OCR]" not in line) and any(k in line for k in keys)
+
+
+# ---------------------------------------------------------------- 环境自检
+# 自检结果缓存：页面刷新/轮询不会反复 import numpy、OCR 这些重依赖；
+# 页面上的 [重新自检] 按钮传 force=True 才会重跑。
+_selfcheck_state = {"result": None, "lock": threading.Lock()}
+
+
+def run_selfcheck(force: bool = False) -> dict:
+    """跑一遍环境自检（Python 版本、依赖包、分辨率/缩放/权限等运行环境）。"""
+    with _selfcheck_state["lock"]:
+        cached = _selfcheck_state["result"]
+    if cached is not None and not force:
+        return cached
+    try:
+        result = selfcheck.run_checks()
+    except Exception as exc:  # 自检自己崩了也要给页面一个结论，不能白屏
+        traceback.print_exc()
+        result = {
+            "ok": False, "failed": 1, "warned": 0, "passed": 0, "total": 0,
+            "summary": f"自检执行失败：{type(exc).__name__}: {exc}",
+            "python": f"{sys.version_info.major}.{sys.version_info.minor}."
+                      f"{sys.version_info.micro}",
+            "checked_at": datetime.now().isoformat(timespec="seconds"),
+            "items": [],
+        }
+    with _selfcheck_state["lock"]:
+        _selfcheck_state["result"] = result
+    _log_selfcheck(result)
+    return result
+
+
+def _log_selfcheck(result: dict):
+    """自检结论写进控制台日志：❌/⚠️ 逐条提示，方便照着提示修。"""
+    _log("SYS", f"环境自检：{result.get('summary', '')}")
+    for item in result.get("items", []):
+        status = item.get("status")
+        if status == selfcheck.STATUS_OK:
+            continue
+        level = "ERROR" if status == selfcheck.STATUS_FAIL else "WARN"
+        text = (f"环境自检 {selfcheck.STATUS_ICON.get(status, '')} "
+                f"{item.get('label', '')}：{item.get('detail', '')}")
+        if item.get("hint"):
+            text += f" —— {item['hint']}"
+        _log(level, text)
+
+
+def start_selfcheck_async():
+    """脚本启动时后台跑一遍自检：第一次打开脚本就能看到依赖是否齐全。"""
+    def _run():
+        try:
+            run_selfcheck(force=True)
+        except Exception:
+            pass
+
+    thread = threading.Thread(target=_run, name="hs-selfcheck", daemon=True)
+    thread.start()
+    return thread
+
+
+def selfcheck_summary() -> dict:
+    """给 /api/status 的精简自检结论（完整明细走 /api/selfcheck）。"""
+    with _selfcheck_state["lock"]:
+        result = _selfcheck_state["result"]
+    if not result:
+        return {"checked": False}
+    return {
+        "checked": True,
+        "ok": bool(result.get("ok")),
+        "failed": int(result.get("failed", 0)),
+        "warned": int(result.get("warned", 0)),
+        "summary": result.get("summary", ""),
+        "checked_at": result.get("checked_at"),
+        "python": result.get("python"),
+    }
+
+
+def api_selfcheck(force: bool = True) -> dict:
+    return {"ok": True, "result": run_selfcheck(force=force)}
+
+
+def api_regions() -> dict:
+    """截一张屏幕并画出所有截图区域框（只截图，不点击、不移动鼠标）。"""
+    try:
+        result = screen_regions.build_region_preview()
+    except Exception as exc:
+        traceback.print_exc()
+        return {"ok": False,
+                "error": f"截图失败：{type(exc).__name__}: {exc}"}
+    failed = [c for c in result.get("checks", [])
+              if c.get("status") == selfcheck.STATUS_FAIL]
+    if failed:
+        _log("WARN", "截图区域框：" + "；".join(
+            f"{c.get('label', '')} {c.get('detail', '')}" for c in failed))
+    else:
+        _log("SYS", f"截图区域框：分辨率 {result['width']}×{result['height']}，"
+                    f"已标注 {len(result.get('regions', []))} 个区域")
+    return {"ok": True, "result": result}
+
+
+def take_logs_after(seq: int):
+    with _log_lock:
+        lines = [e for e in _log_buffer if e["seq"] > seq]
+        return lines, _log_seq
+
+
+# ---------------------------------------------------------------- stdout 捕获
+_stdout_original = None
+
+
+class _TeeStream:
+    """把自动化线程的 print 输出同时送进 UI 日志缓冲。"""
+
+    def __init__(self, original):
+        self._original = original
+
+    def write(self, text):
+        try:
+            self._original.write(text)
+        except Exception:
+            pass
+        text = str(text)
+        if text and text.strip():
+            level = "INFO"
+            for lv in ("ERROR", "WARN", "DEBUG", "SYS"):
+                if f"{lv}]" in text:
+                    level = lv
+                    break
+            for line in text.splitlines():
+                if line.strip():
+                    _log(level, line.rstrip())
+
+    def flush(self):
+        try:
+            self._original.flush()
+        except Exception:
+            pass
+
+    def isatty(self):
+        return getattr(self._original, "isatty", lambda: False)()
+
+    def fileno(self):
+        return getattr(self._original, "fileno", lambda: -1)()
+
+
+def _stdout_capture_start():
+    global _stdout_original
+    if _stdout_original is not None:
+        return
+    _stdout_original = sys.stdout
+    sys.stdout = _TeeStream(_stdout_original)
+
+
+def _stdout_capture_stop():
+    global _stdout_original
+    if _stdout_original is None:
+        return
+    try:
+        sys.stdout = _stdout_original
+    finally:
+        _stdout_original = None
+
+
+# ---------------------------------------------------------------- 控制器
+class _Controller:
+    def __init__(self):
+        self.lock = threading.RLock()
+        self.fsm = None
+        self.automation_thread = None
+        self.scheduler_thread = None
+        self.starting = False
+        self.phase = "idle"    # idle | waiting | playing | stopping | finished
+        self.stopped_by = None  # schedule | user_after_game | user_immediate | ctrlq
+        self.schedule = {"start": None, "end": None}
+        self.last_error = None
+        self.last_summary = None
+        self.hotkey_registered = False
+        # 已“就绪”（点过「开始运行」：浮窗已开 + 炉石已切前台，但还没真正开始对战）
+        self.prepared = False
+
+
+CTRL = _Controller()
+
+
+def _apply_constants(name: str, log_root: str):
+    """把页面配置注入 constants，并同步到已导入模块的绑定副本。"""
+    import constants.constants as cc
+    if name:
+        cc.YOUR_NAME = name
+    if log_root:
+        cc.HEARTHSTONE_LOG_ROOT = log_root
+    try:
+        import log_op
+        import log_state
+        log_op.HEARTHSTONE_LOG_ROOT = cc.HEARTHSTONE_LOG_ROOT
+        log_state.HEARTHSTONE_LOG_ROOT = cc.HEARTHSTONE_LOG_ROOT
+        log_state.MY_NAME = cc.YOUR_NAME
+    except Exception:
+        pass
+    if CTRL.fsm is not None:
+        CTRL.fsm.HEARTHSTONE_LOG_ROOT = cc.HEARTHSTONE_LOG_ROOT
+        CTRL.fsm.log_state.HEARTHSTONE_LOG_ROOT = cc.HEARTHSTONE_LOG_ROOT
+        CTRL.fsm.log_state.MY_NAME = cc.YOUR_NAME
+
+
+def _persist_schedule(start_dt, end_dt):
+    cfg = load_config()
+    cfg["schedule_start"] = (
+        start_dt.isoformat(timespec="minutes") if start_dt else None)
+    cfg["schedule_end"] = (
+        end_dt.isoformat(timespec="minutes") if end_dt else None)
+    save_config(cfg)
+
+
+# ---------------------------------------------------------------- 自动化线程
+def _reset_score(fsm):
+    """战绩清零：只有“重新开始”（网页/浮窗的「开始对战」）才调用。
+
+    浮窗的「恢复」是暂停→续跑，必须保留已累计的场数/胜场/认输数，
+    否则一按恢复战绩就归零（用户反馈）。
+    """
+    fsm.game_count = 0
+    fsm.win_count = 0
+    fsm.concede_count = 0
+
+
+def _start_automation(reset_stats: bool = True):
+    """启动自动化；reset_stats=False 表示浮窗「恢复」续跑，保留已有战绩。"""
+    cfg = load_config()
+    name = (cfg.get("name") or "").strip()
+    log_root = (cfg.get("log_root") or "").strip()
+    try:
+        _apply_constants(name, log_root)
+        import FSM_action as fsm
+        CTRL.fsm = fsm
+    except Exception as exc:
+        traceback.print_exc()
+        return False, f"自动化组件加载失败：{exc}"
+    fsm = CTRL.fsm
+    # 重置运行状态；每次“打开脚本/开始对战”时战绩清零，从 0 计；
+    # 浮窗「恢复」续跑（reset_stats=False）不清零，从上次的场数/胜场继续累加。
+    fsm.quitting_flag = False
+    fsm.stop_after_current_game = False
+    fsm.FSM_state = ""
+    fsm.time_begin = 0.0
+    if reset_stats:
+        _reset_score(fsm)
+    try:
+        fsm.print_info_init()
+        fsm.init()
+    except Exception as exc:
+        traceback.print_exc()
+        return False, f"自动化初始化失败：{exc}"
+    CTRL.last_error = None
+    CTRL.last_summary = None
+    CTRL.stopped_by = None
+    CTRL.phase = "playing"
+    CTRL.prepared = True
+    if reset_stats:
+        _log("SYS", f"自动化启动：用户 {name}，日志目录 {log_root}（战绩从 0 开始）")
+    else:
+        _log("SYS", f"自动化恢复：用户 {name}，日志目录 {log_root}"
+                    f"（战绩继续累计：已完成 {int(getattr(fsm, 'game_count', 0) or 0)} 场）")
+    if name and "#" not in name:
+        _log("WARN", "用户 ID 未包含 #编号，可能无法识别己方玩家，建议填写完整战网昵称。")
+    _stdout_capture_start()
+    _register_hotkey()
+    t = threading.Thread(target=_automation_worker, args=(fsm,),
+                         name="hs-automation", daemon=True)
+    CTRL.automation_thread = t
+    t.start()
+    return True, "自动化已启动"
+
+
+def _automation_worker(fsm):
+    summary = {"games": 0, "wins": 0}
+    _bind_overlay()
+    # 自动化在后台线程运行；get_screen 等模块使用 win32com / win32ui（COM），
+    # COM 要求线程级初始化，否则报“尚未调用 CoInitialize”并导致线程崩溃。
+    com_ready = False
+    try:
+        import pythoncom
+        pythoncom.CoInitialize()
+        com_ready = True
+    except Exception:
+        _log("WARN", "COM 初始化失败（自动化可能仍可运行，若崩溃请检查 pywin32）。")
+    try:
+        fsm.AutoHS_automata()
+    except SystemExit:
+        pass
+    except Exception:
+        tb = traceback.format_exc()
+        traceback.print_exc()
+        _log("ERROR", "自动化线程异常退出，堆栈如下：")
+        for line in tb.rstrip().splitlines():
+            _log("ERROR", "  " + line)
+        with CTRL.lock:
+            CTRL.last_error = "自动化运行异常：请查看页面「实时日志」中的 ERROR 详情。"
+    finally:
+        _stdout_capture_stop()
+        _remove_hotkey()
+        try:
+            fsm.print_info_close()
+        except Exception:
+            pass
+        with CTRL.lock:
+            summary = {
+                "games": int(fsm.game_count),
+                "wins": int(fsm.win_count),
+                "concedes": int(getattr(fsm, "concede_count", 0) or 0),
+            }
+            # 上分达标自动停止：状态机的 stop_after_current_game 置位后线程自己退出，
+            # 这里把它记成「上分达标」，让页面出横幅（读的是 last_summary["stopped_by"]）。
+            rank_reason = getattr(fsm, "_rank_stop_stop_reason", None)
+            rank_reached = bool(getattr(fsm, "_rank_stop_triggered", False)
+                                and rank_reason)
+            if rank_reached:
+                CTRL.stopped_by = "rank_reached"
+                CTRL.phase = "finished"
+            CTRL.last_summary = {**summary, "stopped_by": CTRL.stopped_by}
+            CTRL.automation_thread = None
+            if CTRL.phase == "stopping" and CTRL.stopped_by == "schedule":
+                CTRL.phase = "finished"
+                CTRL.schedule = {"start": None, "end": None}
+                _persist_schedule(None, None)
+            elif not rank_reached:
+                CTRL.phase = "idle"
+        if summary["games"]:
+            _log("SYS", f"自动化结束：共完成 {summary['games']} 场对战，"
+                        f"赢 {summary['wins']} 场"
+                        f"{'，自动认输 ' + str(summary['concedes']) + ' 场' if summary['concedes'] else ''}。")
+        else:
+            _log("SYS", "自动化结束。")
+        if com_ready:
+            try:
+                import pythoncom
+                pythoncom.CoUninitialize()
+            except Exception:
+                pass
+
+
+# ---------------------------------------------------------------- 热键
+def _register_hotkey():
+    try:
+        import keyboard
+        try:
+            keyboard.remove_hotkey("ctrl+q")
+        except Exception:
+            pass
+        keyboard.add_hotkey("ctrl+q", _on_ctrl_q)
+        CTRL.hotkey_registered = True
+        _log("SYS", "热键 Ctrl+Q 已注册（立即停止）。")
+    except Exception as exc:
+        CTRL.hotkey_registered = False
+        _log("WARN", f"注册 Ctrl+Q 热键失败：{exc}（仍可通过页面停止）")
+
+
+def _remove_hotkey():
+    try:
+        import keyboard
+        keyboard.remove_hotkey("ctrl+q")
+    except Exception:
+        pass
+    CTRL.hotkey_registered = False
+
+
+def _on_ctrl_q():
+    _log("WARN", "收到 Ctrl+Q，立即停止自动化。")
+    with CTRL.lock:
+        CTRL.phase = "idle"
+        CTRL.stopped_by = "ctrlq"
+        CTRL.schedule = {"start": None, "end": None}
+    _persist_schedule(None, None)
+    try:
+        CTRL.fsm.request_immediate_stop()
+    except Exception:
+        pass
+
+
+# ---------------------------------------------------------------- 定时调度
+def _schedule_worker(start_dt: datetime, end_dt):
+    try:
+        while datetime.now() < start_dt:
+            with CTRL.lock:
+                if CTRL.schedule.get("start") != start_dt:
+                    return  # 计划被取消或替换
+            time.sleep(0.5)
+        _log("SYS", "到达计划开始时间，自动启动对战。")
+        ok, msg = _start_automation()
+        if not ok:
+            with CTRL.lock:
+                CTRL.phase = "idle"
+                CTRL.schedule = {"start": None, "end": None}
+                CTRL.last_error = msg
+            _persist_schedule(None, None)
+            _log("ERROR", f"定时启动失败：{msg}")
+            return
+        if end_dt is None:
+            return
+        while datetime.now() < end_dt:
+            with CTRL.lock:
+                if (CTRL.schedule.get("start") != start_dt
+                        or CTRL.automation_thread is None):
+                    return
+            time.sleep(0.5)
+        _log("SYS", "到达计划结束时间：等待本局对战打完再停止。")
+        with CTRL.lock:
+            CTRL.phase = "stopping"
+            CTRL.stopped_by = "schedule"
+        try:
+            CTRL.fsm.request_stop_after_game()
+        except Exception as exc:
+            _log("ERROR", f"发送停止请求失败：{exc}")
+        # 等待自动化线程自然退出（对局结束后）
+        while True:
+            with CTRL.lock:
+                if CTRL.schedule.get("start") != start_dt:
+                    return
+                t = CTRL.automation_thread
+            if t is None or not t.is_alive():
+                break
+            time.sleep(1)
+    except Exception:
+        traceback.print_exc()
+
+
+# ---------------------------------------------------------------- API 实现
+STATE_LABELS = {
+    "": "待机",
+    "Leave Hearth Stone": "炉石未运行",
+    "Wait main menu": "等待主菜单",
+    "Main Menu": "主菜单",
+    "Choosing Hero": "选择职业",
+    "Match Opponent": "匹配对手",
+    "Choosing Card": "换牌阶段",
+    "Battling": "对战中",
+    "Quitting Battle": "对局结算",
+    "ERROR": "状态异常",
+}
+
+
+def api_save_config(body: dict):
+    name = str(body.get("name") or "").strip()
+    log_root = str(body.get("log_root") or "").strip()
+    warnings = []
+    if name and "#" not in name:
+        warnings.append("建议填写完整战网昵称（含 #编号），否则可能无法识别己方玩家。")
+    if log_root and not os.path.isdir(log_root):
+        warnings.append("日志目录不存在，请确认路径正确（通常为炉石安装目录下的 Logs 文件夹）。")
+    with CTRL.lock:
+        if CTRL.automation_thread is not None:
+            return {"ok": False, "error": "自动化运行中，请先停止后再修改配置。"}
+        cfg = load_config()
+        cfg["name"] = name
+        cfg["log_root"] = log_root
+        save_config(cfg)
+        _apply_constants(name, log_root)
+    _log("SYS", f"配置已保存：用户 {name or '（未填写）'}，日志目录 {log_root or '（未填写）'}")
+    return {"ok": True, "message": "配置已保存", "warnings": warnings}
+
+
+def api_save_strategy(body):
+    """保存「策略选择」（ui_config.json 的 strategy 键）。
+
+    hsbox=盒子AI（OCR 读推荐面板） / renwumu=任务牧 / yurensa=鱼人萨。
+    换策略会改变换牌与出牌听谁的，所以和"用户ID/日志目录"一样，
+    自动化运行期间不允许改（下一局开始生效）。
+    """
+    key = str(body.get("strategy") or "").strip()
+    if key not in STRATEGY_CHOICES:
+        return {"ok": False, "error": f"未知策略：{key}"}
+    with CTRL.lock:
+        if CTRL.automation_thread is not None:
+            return {"ok": False, "error": "自动化运行中，请先停止后再修改策略选择。"}
+        try:
+            save_strategy_setting(key)
+        except Exception as exc:
+            return {"ok": False, "error": f"策略保存失败：{exc}"}
+    label = strategy_label(key)
+    _log("SYS", f"策略已切换为：{label}（下一局生效）。")
+    return {"ok": True, "message": f"策略已保存：{label}",
+            "strategy": {"key": key, "label": label,
+                         "choices": strategy_options()}}
+
+
+def api_save_concede(body):
+    """保存自动投降配置（ui_config.json 的 auto_concede 段）。"""
+    with CTRL.lock:
+        if CTRL.automation_thread is not None:
+            return {"ok": False, "error": "自动化运行中，请先停止后再修改自动投降配置。"}
+        cfg = load_config()
+        ac = dict(cfg.get("auto_concede") or DEFAULT_AUTO_CONCEDE)
+        ac["enabled"] = bool(body.get("enabled", ac.get(
+            "enabled", DEFAULT_AUTO_CONCEDE["enabled"])))
+        try:
+            threshold = float(body.get("threshold", ac.get(
+                "threshold", DEFAULT_AUTO_CONCEDE["threshold"])))
+        except (TypeError, ValueError):
+            return {"ok": False, "error": "阈值必须为数字（0-100）。"}
+        threshold = max(0.0, min(100.0, threshold))
+        try:
+            rounds = int(body.get("rounds", ac.get(
+                "rounds", DEFAULT_AUTO_CONCEDE["rounds"])))
+        except (TypeError, ValueError):
+            return {"ok": False, "error": "连续回合数必须为整数（1-50）。"}
+        rounds = max(1, min(50, rounds))
+        ac["threshold"] = threshold
+        ac["rounds"] = rounds
+        cfg["auto_concede"] = ac
+        save_config(cfg)
+    _log("SYS", f"自动投降配置已保存：{'开启' if ac['enabled'] else '关闭'}，"
+                f"阈值 {threshold:.0f}%，连续 {rounds} 回合。")
+    return {"ok": True, "message": "自动投降配置已保存",
+            "concede": {"enabled": ac["enabled"],
+                        "threshold": threshold, "rounds": rounds}}
+
+
+# ------------------------------------------------------------------ 上分停止条件（可选）
+def _current_rank_stop() -> dict:
+    """返回当前生效的上分停止配置（默认值叠加 ui_config.json 的 rank_stop 段）。"""
+    cfg = dict(DEFAULT_RANK_STOP)
+    saved = load_config().get("rank_stop")
+    if isinstance(saved, dict):
+        for key in cfg:
+            if saved.get(key) is not None:
+                cfg[key] = saved[key]
+    cfg["enabled"] = bool(cfg["enabled"])
+    if cfg["mode"] not in ("legend", "legend_number"):
+        cfg["mode"] = DEFAULT_RANK_STOP["mode"]
+    try:
+        cfg["legend_number"] = int(cfg["legend_number"])
+    except (TypeError, ValueError):
+        cfg["legend_number"] = DEFAULT_RANK_STOP["legend_number"]
+    cfg["legend_number"] = max(1, min(100000, cfg["legend_number"]))
+    return cfg
+
+
+def api_save_rank_stop(body):
+    """保存「上分停止条件」（ui_config.json 的 rank_stop 段）。
+
+    每局结束时读一次结算界面的段位数字，命中条件就让自动化在本局结束后停止。
+    """
+    with CTRL.lock:
+        if CTRL.automation_thread is not None:
+            return {"ok": False, "error": "自动化运行中，请先停止后再修改上分停止条件。"}
+        cfg = load_config()
+        rank = _current_rank_stop()
+        rank["enabled"] = bool(body.get("enabled", rank["enabled"]))
+        mode = str(body.get("mode") or rank["mode"]).strip()
+        if mode not in ("legend", "legend_number"):
+            return {"ok": False,
+                    "error": "停止方式只能选「上传说」或「上到传说某个名次」。"}
+        rank["mode"] = mode
+        try:
+            number = int(body.get("legend_number", rank["legend_number"]))
+        except (TypeError, ValueError):
+            return {"ok": False, "error": "传说名次必须为整数（1-100000）。"}
+        rank["legend_number"] = max(1, min(100000, number))
+        cfg["rank_stop"] = rank
+        save_config(cfg)
+    if not rank["enabled"]:
+        detail = "已关闭"
+    elif rank["mode"] == "legend":
+        detail = "上传说即停"
+    else:
+        detail = f"上到传说第 {rank['legend_number']} 名或更好时停"
+    _log("SYS", f"上分停止条件已保存：{detail}。")
+    return {"ok": True, "message": "上分停止条件已保存", "rank_stop": rank}
+
+
+def _rank_stop_state() -> dict:
+    """上分停止的显示状态：自动化已加载时取状态机实时值，否则用配置兜底。"""
+    with CTRL.lock:
+        fsm = CTRL.fsm
+    if fsm is not None and hasattr(fsm, "rank_stop_detection_state"):
+        try:
+            return fsm.rank_stop_detection_state()
+        except Exception:
+            pass
+    cfg = _current_rank_stop()
+    return {"enabled": cfg["enabled"], "mode": cfg["mode"],
+            "legend_number": cfg["legend_number"], "last_number": None,
+            "last_legend": None, "last_raw": None, "last_empty": False,
+            "triggered": False, "stop_reason": None}
+
+
+# ------------------------------------------------------------------ 活人感（可选）
+def _current_human_like() -> dict:
+    """返回当前生效的活人感配置（默认值叠加 ui_config.json 的 human_like 段）。"""
+    cfg = dict(DEFAULT_HUMAN_LIKE)
+    saved = load_config().get("human_like")
+    if isinstance(saved, dict):
+        for key in cfg:
+            if saved.get(key) is not None:
+                cfg[key] = saved[key]
+    return cfg
+
+
+def api_save_human_like(body):
+    """保存活人感配置（ui_config.json 的 human_like 段）。"""
+    with CTRL.lock:
+        if CTRL.automation_thread is not None:
+            return {"ok": False, "error": "自动化运行中，请先停止后再修改活人感配置。"}
+        cfg = load_config()
+        hl = _current_human_like()
+        hl["enabled"] = bool(body.get("enabled", hl["enabled"]))
+        # 「看卡牌」「看随从」两个独立开关：关掉看卡牌 = 连随机延时一起关，
+        # 关掉看随从 = 不再对着新随从动鼠标。
+        hl["hand_hover_enabled"] = bool(
+            body.get("hand_hover_enabled", hl["hand_hover_enabled"]))
+        hl["minion_hover_enabled"] = bool(
+            body.get("minion_hover_enabled", hl["minion_hover_enabled"]))
+        try:
+            lo = float(body.get("post_delay_min", hl["post_delay_min"]))
+            hi = float(body.get("post_delay_max", hl["post_delay_max"]))
+            h_lo = float(body.get("hover_min", hl["hover_min"]))
+            h_hi = float(body.get("hover_max", hl["hover_max"]))
+            m_lo = float(body.get("minion_hover_min", hl["minion_hover_min"]))
+            m_hi = float(body.get("minion_hover_max", hl["minion_hover_max"]))
+        except (TypeError, ValueError):
+            return {"ok": False, "error": "延时时长/悬停时长必须为数字。"}
+        lo = max(0.0, min(60.0, lo))
+        hi = max(lo, min(60.0, hi))
+        h_lo = max(0.05, min(30.0, h_lo))
+        h_hi = max(h_lo, min(30.0, h_hi))
+        m_lo = max(0.05, min(30.0, m_lo))
+        m_hi = max(m_lo, min(30.0, m_hi))
+        hl.update({"post_delay_min": lo, "post_delay_max": hi,
+                   "hover_min": h_lo, "hover_max": h_hi,
+                   "minion_hover_min": m_lo, "minion_hover_max": m_hi})
+        hl.pop("hover_seconds", None)   # 旧的固定悬停字段不再使用
+        cfg["human_like"] = hl
+        save_config(cfg)
+    hand_on = "开" if hl["hand_hover_enabled"] else "关"
+    minion_on = "开" if hl["minion_hover_enabled"] else "关"
+    _log("SYS", f"活人感配置已保存：{'开启' if hl['enabled'] else '关闭'}"
+                f"（看卡牌 {hand_on} · 随机延时 {lo:.1f}~{hi:.1f}s"
+                f" · 悬停 {h_lo:.1f}~{h_hi:.1f}s；"
+                f"看随从 {minion_on} · {m_lo:.1f}~{m_hi:.1f}s）。")
+    return {"ok": True, "message": "活人感配置已保存", "human_like": hl}
+
+
+# ------------------------------------------------------------------ 炉石存活检测
+def _current_liveness() -> dict:
+    """返回当前生效的存活检测配置（默认值叠加 ui_config.json 的 liveness 段）。"""
+    cfg = dict(DEFAULT_LIVENESS)
+    saved = load_config().get("liveness")
+    if isinstance(saved, dict):
+        for key in cfg:
+            if saved.get(key) is not None:
+                cfg[key] = saved[key]
+    return cfg
+
+
+def api_save_liveness(body):
+    """保存存活检测配置（ui_config.json 的 liveness 段）。
+
+    这是安全兜底功能：炉石闪退/卡死后脚本不能一直对着失效画面空转
+    （issue 反馈空转近 3 小时），所以默认开启，但允许用户关闭。
+    """
+    with CTRL.lock:
+        if CTRL.automation_thread is not None:
+            return {"ok": False, "error": "自动化运行中，请先停止后再修改存活检测配置。"}
+        cfg = load_config()
+        lv = _current_liveness()
+        lv["enabled"] = bool(body.get("enabled", lv["enabled"]))
+        try:
+            warn = float(body.get("log_stale_warn_seconds",
+                                  lv["log_stale_warn_seconds"]))
+            stop = float(body.get("log_stale_stop_seconds",
+                                  lv["log_stale_stop_seconds"]))
+        except (TypeError, ValueError):
+            return {"ok": False, "error": "停滞阈值必须为数字（秒）。"}
+        warn = max(1.0, min(3600.0, warn))
+        stop = max(warn, min(7200.0, stop))
+        lv["log_stale_warn_seconds"] = warn
+        lv["log_stale_stop_seconds"] = stop
+        cfg["liveness"] = lv
+        save_config(cfg)
+    _log("SYS", f"存活检测配置已保存：{'开启' if lv['enabled'] else '关闭'}"
+                f"（Power.log 停滞 {warn:.0f}s 告警 / {stop:.0f}s 自动停止）。")
+    return {"ok": True, "message": "存活检测配置已保存", "liveness": lv}
+
+
+# ------------------------------------------------------------------ 延时设置
+# 各延时字段的边界与默认值（默认值取自 RecommendationConfig，即上游时序）。
+_DELAY_BOUNDS = {
+    "mulligan_ready_delay_seconds": (0.0, 120.0),
+    "mulligan_post_ocr_delay_seconds": (0.0, 30.0),
+    "mulligan_retry_delay_seconds": (0.0, 60.0),
+    "first_turn_per_card_delay_seconds": (0.0, 20.0),
+    "pre_action_delay_seconds": (0.0, 60.0),
+    "post_action_delay_seconds": (0.0, 10.0),
+    "draw_extra_delay_per_card_seconds": (0.0, 20.0),
+    "discover_target_delay_seconds": (0.0, 5.0),
+    "ocr_preprocess_scale": (0.5, 4.0),
+}
+
+def _current_delays() -> dict:
+    """返回当前生效的延时配置（默认值叠加 ui_config.json 的 delays 段）。"""
+    return {key: getattr(RecommendationConfig(), key)
+            for key in _USER_DELAY_KEYS}
+
+
+def api_save_delays(body):
+    """保存延时配置（ui_config.json 的 delays 段）。"""
+    with CTRL.lock:
+        if CTRL.automation_thread is not None:
+            return {"ok": False, "error": "自动化运行中，请先停止后再修改延时配置。"}
+        cfg = load_config()
+        delays = dict(cfg.get("delays") or {})
+        for key in _USER_DELAY_KEYS:
+            if key not in body:
+                continue
+            try:
+                value = float(body[key])
+            except (TypeError, ValueError):
+                return {"ok": False, "error": f"{key} 必须为数字。"}
+            lo, hi = _DELAY_BOUNDS[key]
+            if not (lo <= value <= hi):
+                return {"ok": False,
+                        "error": f"{key} 必须介于 {lo}–{hi}。"}
+            delays[key] = value
+        cfg["delays"] = delays
+        save_config(cfg)
+    _log("SYS", "延时配置已保存。")
+    return {"ok": True, "message": "延时配置已保存", "delays": _current_delays()}
+
+
+def api_start(body: dict):
+    body = body or {}
+    # 浮窗「恢复」续跑：keep_score=True 时保留已累计战绩（场数/胜场/认输数），
+    # 只有“重新开始”才从 0 计。
+    keep_score = bool(body.get("keep_score"))
+    with CTRL.lock:
+        if CTRL.automation_thread is not None or CTRL.starting:
+            return {"ok": False, "error": "自动化已经在运行中。"}
+        cfg = load_config()
+        name = (cfg.get("name") or "").strip()
+        log_root = (cfg.get("log_root") or "").strip()
+        if not name:
+            return {"ok": False, "error": "请先填写用户 ID。"}
+        if not log_root:
+            return {"ok": False, "error": "请先填写炉石日志目录。"}
+        if not os.path.isdir(log_root):
+            return {"ok": False, "error": f"日志目录不存在：{log_root}"}
+        # 手动开始会取消尚未开始的定时计划
+        CTRL.schedule = {"start": None, "end": None}
+    _persist_schedule(None, None)
+    if keep_score:
+        _log("SYS", "收到恢复请求，正在续跑自动化（战绩继续累计，不清零）……")
+    else:
+        _log("SYS", "收到启动请求，正在初始化自动化组件（首次启动可能较慢，请稍候）……")
+
+    def _boot():
+        ok, msg = _start_automation(reset_stats=not keep_score)
+        if not ok:
+            with CTRL.lock:
+                CTRL.last_error = msg
+            _log("ERROR", msg)
+
+    threading.Thread(target=_boot, name="hs-boot", daemon=True).start()
+    if keep_score:
+        return {"ok": True, "message": "正在恢复自动化（战绩继续累计），请稍候……"}
+    return {"ok": True, "message": "正在启动自动化，请稍候……"}
+
+
+def _bring_hearthstone_foreground():
+    """把炉石切到最前台（未运行则先拉起战网）。
+
+    仅在“开始运行/就绪”时按需调用；COM 需要线程级初始化。
+    """
+    try:
+        import pythoncom
+        pythoncom.CoInitialize()
+    except Exception:
+        pass
+    try:
+        import click
+        click.enter_HS()
+    except Exception as exc:
+        _log("WARN", f"切换到炉石前台失败：{exc}")
+
+
+def api_prepare(body=None):
+    """「开始运行」第一步：开日志浮窗 + 把炉石切到前台，但【不】开始自动对战。
+
+    真正的对战由「开始对战」按钮（本接口返回 prepared=True 后按钮会变成它）
+    或浮窗的 ▶ 开始对战 触发，避免点一下就开始打牌。
+
+    浮窗"正在收尾"时 start() 会排队等上一轮结束再自动开出来（返回 pending）：
+    这时文案说清楚"稍等 1–2 秒"，不再是"点了没反应"（用户反馈过：点「退出浮窗」
+    后从网页点开始，浮窗再也弹不出来）。
+    """
+    with CTRL.lock:
+        if CTRL.automation_thread is not None or CTRL.starting:
+            return {"ok": False, "error": "自动化已经在运行中。"}
+        CTRL.prepared = True
+    status = None
+    if log_overlay is not None and not log_overlay.is_running():
+        try:
+            status = _bind_overlay()
+        except Exception as exc:
+            _log("WARN", f"开启日志浮窗失败：{exc}")
+    threading.Thread(target=_bring_hearthstone_foreground,
+                     name="hs-prepare", daemon=True).start()
+    # 浮窗可能刚被判定"没起来"（校验线程同步返回时）：按真实状态回话，别谎报就绪。
+    with CTRL.lock:
+        prepared = bool(CTRL.prepared)
+    if not prepared:
+        _log("WARN", "浮窗还没能打开：请再点一次「🪟 日志浮窗」或"
+                     "「🪄 开始运行（准备）」重试。")
+        return {"ok": True, "prepared": False,
+                "message": "浮窗还没能打开：请再点一次「🪟 日志浮窗」或"
+                           "「🪄 开始运行（准备）」重试。"}
+    if status == "pending":
+        _log("SYS", "日志浮窗正在重新打开（上一轮还在收尾），稍等 1–2 秒；"
+                    "同时正在把炉石切到前台。")
+        return {"ok": True, "prepared": True,
+                "message": "浮窗正在重新打开（上一轮在收尾，稍等 1–2 秒就会出现），"
+                           "同时正在把炉石切到前台；再点一次「开始对战」才会真正开打。"}
+    _log("SYS", "已就绪：日志浮窗已开启、正在把炉石切到前台；未开始对战，"
+                "确认无误后再点「开始对战」。")
+    return {"ok": True, "prepared": True,
+            "message": "已就绪：浮窗已开、炉石已切前台（不会自动开始）。"
+                       "再点一次「开始对战」或浮窗的 ▶ 开始对战 才会真正开打。"}
+
+
+def api_stop(body: dict):
+    mode = str(body.get("mode") or "now")
+    if mode == "after_game":
+        with CTRL.lock:
+            if CTRL.automation_thread is None:
+                return {"ok": False, "error": "当前没有正在运行的自动化。"}
+            fsm = CTRL.fsm
+            CTRL.phase = "stopping"
+            CTRL.stopped_by = "user_after_game"
+            if CTRL.schedule.get("end"):
+                CTRL.schedule = {"start": None, "end": None}
+                _persist_schedule(None, None)
+        try:
+            fsm.request_stop_after_game()
+        except Exception as exc:
+            return {"ok": False, "error": f"发送停止请求失败：{exc}"}
+        _log("WARN", "已请求：本局对战结束后停止。")
+        return {"ok": True, "message": "本局对战结束后将自动停止"}
+    with CTRL.lock:
+        if CTRL.automation_thread is None:
+            return {"ok": False, "error": "当前没有正在运行的自动化。"}
+        fsm = CTRL.fsm
+        CTRL.phase = "idle"
+        CTRL.stopped_by = "user_immediate"
+        CTRL.schedule = {"start": None, "end": None}
+    _persist_schedule(None, None)
+    try:
+        fsm.request_immediate_stop()
+    except Exception as exc:
+        return {"ok": False, "error": f"发送停止指令失败：{exc}"}
+    _log("WARN", "已发送立即停止指令。")
+    return {"ok": True, "message": "正在停止……"}
+
+
+def api_schedule(body: dict):
+    start_text = str(body.get("start") or "").strip()
+    end_text = str(body.get("end") or "").strip()
+    try:
+        start_dt = datetime.fromisoformat(start_text)
+    except ValueError:
+        return {"ok": False, "error": "开始时间格式不正确。"}
+    end_dt = None
+    if end_text:
+        try:
+            end_dt = datetime.fromisoformat(end_text)
+        except ValueError:
+            return {"ok": False, "error": "结束时间格式不正确。"}
+    now = datetime.now()
+    if start_dt < now:
+        return {"ok": False, "error": "开始时间不能早于当前时间。"}
+    if end_dt is not None and end_dt <= start_dt:
+        return {"ok": False, "error": "结束时间必须晚于开始时间。"}
+    with CTRL.lock:
+        if CTRL.automation_thread is not None:
+            return {"ok": False, "error": "自动化运行中，请先停止后再设置定时任务。"}
+    with CTRL.lock:
+        CTRL.schedule = {"start": start_dt, "end": end_dt}
+        CTRL.phase = "waiting"
+        CTRL.stopped_by = None
+        CTRL.last_summary = None
+    _persist_schedule(start_dt, end_dt)
+    t = threading.Thread(target=_schedule_worker, args=(start_dt, end_dt),
+                         name="hs-scheduler", daemon=True)
+    CTRL.scheduler_thread = t
+    t.start()
+    end_text = f"，{end_dt:%m-%d %H:%M} 结束" if end_dt else "，不设结束时间（运行至手动停止）"
+    _log("SYS", f"定时任务已设置：{start_dt:%m-%d %H:%M} 开始{end_text}。")
+    return {"ok": True, "message": "定时任务已设置，请保持本程序运行。"}
+
+
+# ---------------------------------------------------------------- 校准工具
+# 网页按钮、浮窗「校准」按钮、命令行 python calibrate_roi.py 打开的都是同一个
+# 校准窗口（calibrate_roi.py）。这里只维护「同一时刻最多一个」的会话句柄。
+_CALIBRATION_PROC = None
+CALIBRATION_HINT = ("拖框对齐后按 S 保存：1 推荐面板 · 2 换牌确认按钮 · "
+                    "3 AI胜率浮动条（Tab 切换，Esc 退出）")
+
+
+def _calibration_running() -> bool:
+    proc = _CALIBRATION_PROC
+    try:
+        return proc is not None and proc.poll() is None
+    except Exception:
+        return False
+
+
+def _start_calibration() -> dict:
+    """启动校准窗口（已在跑就直接复用，不重复开窗）。"""
+    global _CALIBRATION_PROC
+    if _calibration_running():
+        return {"ok": True, "running": True,
+                "message": f"校准窗口已在屏幕上：{CALIBRATION_HINT}"}
+    script = ROOT / "calibrate_roi.py"
+    if not script.exists():
+        _log("WARN", f"校准工具缺失：{script}")
+        return {"ok": False, "error": f"校准工具缺失：{script}"}
+    try:
+        _CALIBRATION_PROC = subprocess.Popen([sys.executable, str(script)],
+                                             cwd=str(ROOT))
+    except Exception as exc:
+        _log("WARN", f"启动校准窗口失败：{exc}")
+        return {"ok": False, "error": f"启动校准工具失败：{exc}"}
+    _log("SYS", f"已启动校准窗口：{CALIBRATION_HINT}")
+    return {"ok": True, "running": True,
+            "message": f"校准窗口已启动：{CALIBRATION_HINT}"}
+
+
+def _stop_calibration() -> dict:
+    """关掉校准窗口（浮窗「校准」再点一次 / 关闭脚本时）。"""
+    global _CALIBRATION_PROC
+    proc, _CALIBRATION_PROC = _CALIBRATION_PROC, None
+    if proc is None:
+        return {"ok": True, "running": False, "message": "校准窗口未在运行"}
+    try:
+        if proc.poll() is None:
+            proc.terminate()
+    except Exception as exc:
+        return {"ok": False, "error": f"关闭校准工具失败：{exc}"}
+    return {"ok": True, "running": False, "message": "已关闭校准窗口"}
+
+
+def _toggle_calibration() -> bool:
+    """切换校准窗口，返回切换后是否正在显示（浮窗按钮的返回值）。"""
+    if _calibration_running():
+        _stop_calibration()
+        return False
+    _start_calibration()
+    return _calibration_running()
+
+
+def api_calibrate():
+    """网页「🎯 校准区域」卡片：启动同一个校准窗口。"""
+    result = _start_calibration()
+    if not result.get("ok"):
+        return result
+    return {"ok": True, "message": result.get("message", "")}
+
+
+def _hearthstone_foreground_guard():
+    """常驻守护：确保炉石主窗口在前台（复用脚本开始的置顶方式）。
+
+    每 30 分钟检查一次当前前台窗口；若不是炉石主窗口，就用
+    get_screen.move_window_foreground（同「开始对战」脚本开头的一致）
+    把炉石切回最前台。只在启动 30 分钟后才做第一次校正，避免
+    一打开 web 控制台就把炉石抢到前台（用户只想打开 web）。
+    """
+    interval = 30 * 60
+    try:
+        import pythoncom
+        pythoncom.CoInitialize()   # move_window_foreground 用 WScript.Shell(COM)
+    except Exception:
+        pass
+    try:
+        import get_screen
+        import win32gui
+    except Exception as exc:
+        _log("WARN", f"炉石前台守护不可用：{exc}")
+        return
+    while True:
+        time.sleep(interval)
+        try:
+            hwnd = get_screen.get_HS_hwnd()
+            if not hwnd:
+                continue  # 炉石未运行，跳过
+            if win32gui.GetForegroundWindow() == hwnd:
+                continue  # 已在前台
+            get_screen.move_window_foreground(hwnd)
+            _log("SYS", "检测到炉石不在前台，已自动切换到前台。")
+        except Exception:
+            pass
+
+
+# 常驻阶段监测线程维护的当前阶段标签（供浮窗“开始对战”按钮禁用判定）。
+_current_stage = None
+
+
+def _stage_label(ls):
+    if getattr(ls, "game_entity_id", 0) == 0:
+        return "未对局"
+    if getattr(ls, "is_end", False):
+        return "对局结束"
+    try:
+        turns = ls.game_num_turns_in_play
+    except Exception:
+        turns = 0
+    if turns == 0:
+        return "换牌"
+    if ls.is_my_turn:
+        return "我方出牌"
+    return "对手回合"
+
+
+def _stage_monitor_loop():
+    """常驻阶段监测：独立读 Power.log，阶段变化打 -----xx阶段-----。"""
+    global _current_stage
+    try:
+        from log_state import LogState, log_iter_func, update_state
+    except Exception as exc:
+        _log("WARN", f"阶段监测初始化失败：{exc}")
+        return
+    cfg = load_config()
+    log_root = (cfg.get("log_root") or "").strip()
+    if not log_root:
+        return
+    ls = LogState()
+    try:
+        li = log_iter_func(log_root)
+    except Exception as exc:
+        _log("WARN", f"阶段监测日志读取失败：{exc}")
+        return
+    last = None
+    while True:
+        try:
+            c = next(li)
+            if getattr(c, "log_type", "ERROR") == "ERROR":
+                continue
+            for line in c.message_list:
+                try:
+                    update_state(ls, line)
+                except Exception:
+                    pass
+        except Exception:
+            pass
+        stage = _stage_label(ls)
+        _current_stage = stage
+        if stage != last:
+            last = stage
+            _log("SYS", f"-----{stage}阶段-----")
+        time.sleep(0.3)
+
+
+def _overlay_stop_after():
+    """切换“本局结束后停止”：已设则取消，未设则请求本局结束后停。
+
+    对局进行中随时可反悔（再点一次取消），无需重启脚本。
+    """
+    with CTRL.lock:
+        fsm = CTRL.fsm
+        active = bool(getattr(fsm, "stop_after_current_game", False)) \
+            if fsm is not None else False
+    if active:
+        try:
+            fsm.request_cancel_stop_after_game()
+        except Exception as exc:
+            _log("ERROR", f"取消「本局结束后停止」失败：{exc}")
+    else:
+        api_stop({"mode": "after_game"})
+
+
+def _overlay_is_running():
+    with CTRL.lock:
+        return CTRL.automation_thread is not None
+
+
+def _overlay_is_in_game():
+    """对局是否已开始（换牌/出牌/对手回合），或自动化正在运行。
+
+    供浮窗“开始对战”按钮禁用判定：对局进行中不允许再点开始，
+    避免脚本被误触发而重复启动/复位。
+    """
+    with CTRL.lock:
+        running = CTRL.automation_thread is not None
+    stage = _current_stage
+    if stage in ("换牌", "我方出牌", "对手回合"):
+        return True
+    return running
+
+
+def _overlay_is_stop_after():
+    with CTRL.lock:
+        fsm = CTRL.fsm
+        return bool(getattr(fsm, "stop_after_current_game", False)) if fsm is not None else False
+
+
+def _overlay_algorithm():
+    """本局策略名（盒子AI / 任务牧 / 鱼人萨），供浮窗显示「本局算法」。
+
+    自动化运行时用 fsm 里已定下的本局策略；没运行就显示配置里选的那个。
+    """
+    with CTRL.lock:
+        fsm = CTRL.fsm
+        running = CTRL.automation_thread is not None
+    if running and fsm is not None:
+        try:
+            return fsm.current_strategy_label()
+        except Exception:
+            pass
+    return strategy_label()
+
+
+def _current_score():
+    """自动化战绩唯一数据源 (场数, 胜场, 自动认输数)，供浮窗与 Web 页面共用。
+
+    fsm 尚未初始化时按 0 处理，保证浮窗与 /api/status 口径一致。
+    """
+    with CTRL.lock:
+        fsm = CTRL.fsm
+    games = int(getattr(fsm, "game_count", 0) or 0) if fsm is not None else 0
+    wins = int(getattr(fsm, "win_count", 0) or 0) if fsm is not None else 0
+    concedes = int(getattr(fsm, "concede_count", 0) or 0) if fsm is not None else 0
+    return games, wins, concedes
+
+
+def _overlay_score():
+    """当前自动化战绩 (场数, 胜场, 自动认输数)。供浮窗头部显示胜负情况。"""
+    return _current_score()
+
+
+def _overlay_human_like():
+    """浮窗「活人感」状态行数据（是否开启 + 参数），由 log_overlay 渲染。"""
+    try:
+        hl = _current_human_like()
+    except Exception:
+        return None
+    return hl
+
+
+def _concede_detect_state():
+    """自动投降检测的显示状态。
+
+    自动化模块已加载时取实时值（最近读到的胜率 / 连续计数 / 最近检测回合），
+    否则用配置兜底，保证页面在未运行时也能显示“开/关 + 阈值 + 连续 N 回合”。
+    """
+    with CTRL.lock:
+        fsm = CTRL.fsm
+    if fsm is not None and hasattr(fsm, "concede_detection_state"):
+        try:
+            return fsm.concede_detection_state()
+        except Exception:
+            pass
+    cfg = dict(DEFAULT_AUTO_CONCEDE)
+    saved = load_config().get("auto_concede")
+    if isinstance(saved, dict):
+        cfg.update({k: v for k, v in saved.items() if v is not None})
+    return {"enabled": bool(cfg["enabled"]), "threshold": float(cfg["threshold"]),
+            "rounds": int(cfg["rounds"]), "rate": None, "streak": 0,
+            "checked_turn": None, "triggered": False}
+
+
+def _overlay_concede_detect():
+    """浮窗「投降检测」状态行（与 human_like 同一套回调机制）。"""
+    try:
+        return _concede_detect_state()
+    except Exception:
+        return None
+
+
+def _liveness_state() -> dict:
+    """炉石存活检测状态：自动化已加载时取状态机的实时判定，否则直接采样。
+
+    直接采样让“还没开始对战”时浮窗/网页也能显示炉石进程在不在。
+    """
+    with CTRL.lock:
+        fsm = CTRL.fsm
+    if fsm is not None and hasattr(fsm, "hearthstone_liveness_state"):
+        try:
+            return fsm.hearthstone_liveness_state()
+        except Exception:
+            pass
+    try:
+        from src.safety.hearthstone_liveness import default_monitor
+        state = dict(default_monitor().sample(in_game=False))
+    except Exception:
+        state = {"enabled": bool(_current_liveness().get("enabled")),
+                 "status": "unknown", "process": "unknown", "log_age": None,
+                 "alert": None}
+    state.setdefault("alert", None)
+    return state
+
+
+def _overlay_liveness():
+    """浮窗「炉石」状态行。"""
+    try:
+        return _liveness_state()
+    except Exception:
+        return None
+
+
+def _name_match_state() -> dict:
+    """账号昵称校验状态（无法判断时 matched=None）。"""
+    with CTRL.lock:
+        fsm = CTRL.fsm
+    if fsm is not None and hasattr(fsm, "player_name_state"):
+        try:
+            return fsm.player_name_state()
+        except Exception:
+            pass
+    return {"config": (load_config().get("name") or "").strip(),
+            "players": {}, "matched": None}
+
+
+def _overlay_account():
+    """浮窗「账号」状态行：配置的用户 ID 与日志玩家名是否匹配。"""
+    try:
+        return _name_match_state()
+    except Exception:
+        return None
+
+
+def _overlay_exit():
+    """浮窗“退出脚本”按钮：先停止自动化，再退出整个脚本进程。"""
+    try:
+        with CTRL.lock:
+            running = CTRL.automation_thread is not None
+        if running:
+            api_stop({"mode": "now"})
+    except Exception:
+        pass
+    try:
+        _log("SYS", "用户从浮窗点击“退出脚本”。")
+    except Exception:
+        pass
+    # 屏幕上还开着校准窗口的话先关掉，别让它留在桌面上。
+    try:
+        _stop_calibration()
+    except Exception:
+        pass
+    # 立即可靠结束进程（浮窗/自动化均为 daemon 线程，os._exit 直接终止）。
+    os._exit(0)
+
+
+def _overlay_halt():
+    with CTRL.lock:
+        running = CTRL.automation_thread is not None
+    if running:
+        api_stop({"mode": "now"})
+    else:
+        # 浮窗「恢复」= 暂停后继续：不清零胜负战绩，从上次的场数/胜场接着算。
+        api_start({"keep_score": True})
+
+
+def _bind_overlay():
+    """绑定日志浮窗回调（开始/中止/本局结束后停止 + 状态查询）。
+
+    供自动化线程第一次启动与网页“开启浮窗”共用，避免重复。
+    返回 log_overlay.start() 的结果（already / started / pending），调用方
+    据此判断"浮窗到底开没开"——以前 start() 静默失败，网页却照样报"已就绪"。
+    """
+    if log_overlay is None:
+        return None
+    status = log_overlay.start(
+        on_start=lambda: api_start({}),
+        on_halt=_overlay_halt,
+        is_running=_overlay_is_running,
+        on_stop_after=_overlay_stop_after,
+        is_stop_after=_overlay_is_stop_after,
+        is_in_game=_overlay_is_in_game,
+        score_callback=_overlay_score,
+        # 「本局算法」标签：盒子AI / 任务牧 / 鱼人萨（策略选择）。
+        algorithm_callback=_overlay_algorithm,
+        human_like_callback=_overlay_human_like,
+        concede_callback=_overlay_concede_detect,
+        liveness_callback=_overlay_liveness,
+        account_callback=_overlay_account,
+        # 「账号」行的眼睛按钮：是否显示昵称（默认显示），点一下互换并记住。
+        account_visible_setting=_overlay_account_visible(),
+        on_toggle_account=_overlay_save_account_visible,
+        on_calibrate=_overlay_toggle_calibrate,
+        # 关浮窗时把还开着的校准窗口一并关掉（网页/浮窗打开的是同一个窗口）。
+        on_calibrate_close=_overlay_close_calibrate,
+        # 「重启炉石」：中止进程 + 清空日志目录 + 重新拉起（确认弹窗在浮窗里）。
+        on_restart=_overlay_restart_hearthstone,
+        # 「日志」状态行 + 「打开日志 / 清理日志」两个按钮。
+        logs_callback=_overlay_logs,
+        on_open_logs=_overlay_open_logs,
+        on_clear_logs=_overlay_clear_logs,
+        # 「退出浮窗」：只关窗口，脚本继续跑，网页可以再打开。
+        on_exit_overlay=_overlay_exit_overlay,
+        on_exit=_overlay_exit,
+    )
+    _verify_overlay_opened_async(status)
+    return status
+
+
+# ---------------------------------------------------------------- 脚本日志（浮窗）
+# 扫描结果缓存：浮窗每 350ms 取一次状态，不能每次都去扫 200 个文件。
+LOG_SCAN_TTL = 5.0
+# 体积阈值：决定浮窗「日志」行圆点/数值的颜色（绿 → 黄 → 红）。
+LOG_WARN_BYTES = 100 * 1024 * 1024
+LOG_DANGER_BYTES = 500 * 1024 * 1024
+# 清理完成后，说明列显示"已清理 X"的时间（秒）。
+LOG_CLEAR_FLASH_SECONDS = 10.0
+
+_log_scan_cache = {"at": 0.0, "data": None}
+_log_clear_state = {"at": 0.0, "bytes": 0}
+
+
+def _script_logs_snapshot(force: bool = False) -> dict:
+    """脚本日志快照（带 TTL 缓存）：体积、个数、上次清理结果、颜色阈值。"""
+    now = time.time()
+    cached = _log_scan_cache["data"]
+    if (force or cached is None
+            or now - _log_scan_cache["at"] >= LOG_SCAN_TTL):
+        data = script_logs.scan(LOG_DIR, RUNTIME_LOG)
+        _log_scan_cache["data"] = data
+        _log_scan_cache["at"] = now
+        cached = data
+    snapshot = dict(cached)
+    snapshot["cleared_at"] = _log_clear_state["at"]
+    snapshot["cleared_bytes"] = _log_clear_state["bytes"]
+    snapshot["warn_bytes"] = LOG_WARN_BYTES
+    snapshot["danger_bytes"] = LOG_DANGER_BYTES
+    return snapshot
+
+
+def _script_logs_invalidate() -> None:
+    """清理后让缓存立刻失效，浮窗下一拍就显示新体积。"""
+    _log_scan_cache["at"] = 0.0
+    _log_scan_cache["data"] = None
+
+
+def _overlay_logs():
+    """浮窗「日志」状态行数据（出异常返回 None，浮窗显示"—"）。"""
+    try:
+        return _script_logs_snapshot()
+    except Exception:
+        return None
+
+
+def _overlay_open_logs():
+    """浮窗「打开日志」：Explorer 打开对战日志目录并选中最新一份。"""
+    result = script_logs.open_location(LOG_DIR)
+    paths = f"对战日志目录 {LOG_DIR}；运行日志 {RUNTIME_LOG}"
+    if result.get("ok"):
+        what = "最新一份对战日志" if result.get("opened") == "file" else "日志目录"
+        _log("SYS", f"已打开{what}：{result.get('target')}（{paths}）")
+    else:
+        _log("WARN", f"打开日志位置失败：{result.get('error')}（{paths}）")
+    return bool(result.get("ok"))
+
+
+def _overlay_clear_logs():
+    """浮窗「清理日志」（已确认）：后台删掉脚本自己写的日志，立刻返回不卡浮窗。"""
+    threading.Thread(target=_clear_script_logs_worker,
+                     name="hs-clear-logs", daemon=True).start()
+    return True
+
+
+def _clear_script_logs_worker() -> None:
+    """删除 logs\\对战日志_*.txt + ui_log_last.txt，并把结果写进日志。"""
+    before = _script_logs_snapshot(force=True)
+    if not before.get("bytes") and not before.get("files"):
+        _log("SYS", "已无可清理的脚本日志。")
+        return
+    result = script_logs.clear(LOG_DIR, RUNTIME_LOG,
+                               logger=lambda text: _log("SYS", text))
+    _script_logs_invalidate()
+    _log_clear_state["at"] = time.time()
+    _log_clear_state["bytes"] = int(result.get("freed_bytes") or 0)
+    _log("SYS", "已清理脚本日志：删除 "
+                f"{result.get('removed', 0)} 个文件，释放 "
+                f"{script_logs.format_size(result.get('freed_bytes'))}"
+                f"（清理前 {script_logs.format_size(before.get('bytes'))}）。")
+    if result.get("failed"):
+        names = "、".join(result["failed"][:5])
+        _log("WARN", f"有 {len(result['failed'])} 个日志文件删不掉"
+                     f"（可能正被其它程序打开）：{names}")
+    _script_logs_invalidate()
+
+
+# 浮窗"说过已开"之后，最多等这么久确认它真的在跑（秒）。
+OVERLAY_VERIFY_TIMEOUT = 3.0
+
+
+def _verify_overlay_opened_async(status) -> None:
+    """确认浮窗真的起来了：没起来就写 WARN 并退回"未就绪"（不谎报）。
+
+    只对 log_overlay 明确的返回值（started / pending）做校验：测试里的假
+    浮窗对象返回 None，不参与校验。
+    """
+    if log_overlay is None or status not in ("started", "pending"):
+        return
+    threading.Thread(target=_verify_overlay_opened, args=(status,),
+                     name="hs-overlay-verify", daemon=True).start()
+
+
+def _verify_overlay_opened(status, timeout: float = OVERLAY_VERIFY_TIMEOUT) -> bool:
+    """等浮窗真正在显示；超时就如实报错并把页面退回「开始运行（准备）」。
+
+    至少检查一次（timeout=0 也要先看一眼当前状态）。
+    """
+    deadline = time.time() + float(timeout)
+    while True:
+        try:
+            if log_overlay is not None and log_overlay.is_running():
+                return True
+        except Exception:
+            break
+        if time.time() >= deadline:
+            break
+        time.sleep(0.1)
+    with CTRL.lock:
+        CTRL.prepared = False
+    _log("WARN", "日志浮窗没能打开（上一轮浮窗可能还在收尾）："
+                 f"请再点一次「🪟 日志浮窗」或「🪄 开始运行（准备）」重试"
+                 f"（等了 {float(timeout):.0f} 秒还没看到浮窗）。")
+    return False
+
+
+
+def _overlay_toggle_calibrate():
+    """浮窗「校准」按钮：开/关屏幕上的校准窗口（与网页按钮同一个窗口）。
+
+    窗口里三个截图区域都能拖、都能存；框以外的鼠标是穿透的，只用来对照着把
+    盒子 UI 摆正。返回切换后是否显示。
+    """
+    return bool(_toggle_calibration())
+
+
+def _overlay_close_calibrate():
+    """关浮窗/退出脚本时收掉校准窗口（没开着就什么都不做）。"""
+    if _calibration_running():
+        _stop_calibration()
+
+
+# ---------------------------------------------------------------- 重启炉石
+# 停自动化最多等这么久；超时就放弃（不在不确定的状态下杀进程/删文件）。
+AUTOMATION_STOP_TIMEOUT = 15.0
+
+
+def _launch_hearthstone_via_battlenet():
+    """走战网「开始游戏」拉起炉石（与脚本平时拉起炉石的方式一致）。"""
+    import click
+    return click.enter_HS()
+
+
+def _hearthstone_window_ready() -> bool:
+    """炉石游戏窗口是否已经出现——启动成功的真正判据。"""
+    try:
+        import get_screen
+        return bool(get_screen.test_hs_available())
+    except Exception:
+        return False
+
+
+def _battlenet_window_ready() -> bool:
+    """战网窗口是否已经出现（战网没开时先拉起它，再点「开始游戏」）。"""
+    try:
+        import get_screen
+        return bool(get_screen.get_battlenet_hwnd())
+    except Exception:
+        return False
+
+
+def _overlay_restart_hearthstone():
+    """浮窗「重启炉石」按钮（已确认过）：后台执行，立刻返回不卡浮窗。"""
+    threading.Thread(target=_restart_hearthstone_worker,
+                     name="hs-restart", daemon=True).start()
+    return True
+
+
+def _restart_hearthstone_worker():
+    """停自动化 → 重置日志读取器 → 中止炉石 → 清空日志目录 → 重新拉起炉石。
+
+    每一步都往网页/浮窗写日志；任何一步失败都立刻停下并说明原因，绝不在拿不准
+    的状态下继续删文件。
+    """
+    import hs_restart
+
+    cfg = load_config()
+    log_root = (cfg.get("log_root") or "").strip()
+    info = hs_restart.resolve_paths(log_root)
+    if not info["ok"]:
+        _log("ERROR", f"重启炉石已取消：{info['error']}")
+        return
+
+    _log("SYS", "开始重启炉石：停止自动化 → 中止进程 → 清空日志目录 → 重新启动……")
+    with CTRL.lock:
+        running = CTRL.automation_thread is not None
+    if running:
+        api_stop({"mode": "now"})
+        deadline = time.monotonic() + AUTOMATION_STOP_TIMEOUT
+        stopped = False
+        while time.monotonic() < deadline:
+            with CTRL.lock:
+                if CTRL.automation_thread is None:
+                    stopped = True
+                    break
+            time.sleep(0.3)
+        if not stopped:
+            _log("ERROR", f"重启炉石已取消：自动化没有在 "
+                          f"{AUTOMATION_STOP_TIMEOUT:.0f}s 内停下来。")
+            return
+        _log("SYS", "自动化已停止。")
+
+    # 重建日志读取器：关掉本进程可能还开着的 Power.log 句柄（否则 Windows 上
+    # 删不掉），顺带清空 LogState 里上一局残留的状态。
+    try:
+        fsm = CTRL.fsm
+        if fsm is not None:
+            fsm.init()
+            _log("SYS", "已重置日志读取器（LogState / Power.log 句柄）。")
+    except Exception as exc:
+        _log("WARN", f"重置日志读取器失败（继续执行）：{exc}")
+
+    killed = hs_restart.kill_hearthstone()
+    if not killed.get("ok"):
+        _log("ERROR", f"中止炉石未确认：{killed.get('error')}")
+        if killed.get("running") is True:
+            # 进程确确实实还在：既不能删它正在写的日志，也不能再起第二个实例。
+            _log("ERROR", "炉石进程还在，已取消后续操作（未删日志、未重复启动）。")
+            return
+        # 状态不明（或确认超时）时继续往下走：宁可多试一次把炉石拉回来，
+        # 也不要让它停在“被关掉且没人重启”的状态里。
+        _log("WARN", "进程状态不明确，继续尝试把炉石拉起来（避免停在关闭状态）。")
+    else:
+        _log("SYS", killed.get("message") or "炉石进程已退出。")
+
+    cleared = hs_restart.clear_logs(info["log_root"],
+                                    logger=lambda text: _log("SYS", text))
+    if not cleared.get("ok"):
+        _log("WARN", "有日志条目删不掉：" + "；".join(cleared.get("errors") or []))
+    kept = f"，保留 {', '.join(cleared['skipped'])}" if cleared["skipped"] else ""
+    _log("SYS", f"日志目录已清空：删除 {cleared['removed']} 项{kept}。")
+
+    # 优先走战网（脚本平时就是这么拉炉石的）；战网没开就先拉战网。
+    # 直启 Hearthstone.exe 时进程会秒起秒退（没有战网登录态），所以成功判据是
+    # 「游戏窗口出现」，不是「进程存在」。
+    launched = hs_restart.launch_hearthstone(
+        info["exe"],
+        battlenet_exe=info.get("battlenet_exe"),
+        launcher=_launch_hearthstone_via_battlenet,
+        battlenet_ready=_battlenet_window_ready,
+        window_ready=_hearthstone_window_ready,
+        logger=lambda text: _log("SYS", text))
+    if not launched.get("ok"):
+        _log("ERROR", f"炉石没能自动启动：{launched.get('error')}；"
+                      "请手动打开战网/炉石后再点「开始对战」。")
+        return
+    _log("SYS", f"重启完成：{launched.get('message')}；"
+                "确认无误后点「开始对战」继续。")
+
+
+def _overlay_exit_overlay():
+    """浮窗「退出浮窗」：只写一行日志说明发生了什么（脚本继续运行）。
+
+    同时把「就绪」状态放掉：浮窗关掉之后再点网页大按钮，必须先走「开始运行
+    （准备）」把浮窗重新开起来，而不是直接被当成「开始对战」一点就开打。
+    """
+    try:
+        with CTRL.lock:
+            CTRL.prepared = False
+    except Exception:
+        pass
+    _log("SYS", "浮窗已退出（脚本与自动化继续运行）。再次开始：网页点「开始运行（准备）」"
+                "→再点「开始对战」；只想看日志就点「🪟 日志浮窗」。")
+
+
+def _overlay_account_visible() -> bool:
+    """「账号」行当前是否显示昵称（默认显示）。"""
+    try:
+        from config import overlay_settings
+        return bool(overlay_settings().get("show_account", True))
+    except Exception:
+        return True
+
+
+def _overlay_save_account_visible(visible: bool) -> None:
+    """把「账号」行的显示偏好写进 ui_config.json 的 overlay 段。"""
+    try:
+        from config import save_overlay_setting
+        save_overlay_setting("show_account", bool(visible))
+        _log("SYS", "浮窗「账号」行已" + ("显示战网昵称。" if visible
+                                          else "隐藏战网昵称（点眼睛按钮可恢复）。"))
+    except Exception as exc:
+        _log("WARN", f"保存浮窗显示偏好失败：{exc}")
+
+
+def api_toggle_overlay(body=None):
+    """开/关右上角实时日志浮窗。
+
+    就绪状态跟着浮窗走：关掉浮窗 = 回到未就绪（网页大按钮变回「开始运行（准备）」
+    而不是「开始对战」，避免浮窗都没开就被一点直接开打）；重新开出来 = 就绪。
+    """
+    if log_overlay is None:
+        return {"ok": False, "error": "日志浮窗模块不可用"}
+    if log_overlay.is_running():
+        log_overlay.stop()
+        with CTRL.lock:
+            CTRL.prepared = False
+        return {"ok": True, "enabled": False,
+                "message": "日志浮窗已关闭（已回到未就绪；点「开始运行」重新准备）"}
+    status = _bind_overlay()
+    with CTRL.lock:
+        CTRL.prepared = True
+    if status == "pending":
+        return {"ok": True, "enabled": True,
+                "message": "浮窗正在重新打开（上一轮在收尾，稍等 1–2 秒就会出现）"}
+    return {"ok": True, "enabled": True,
+            "message": "日志浮窗已开启（已就绪；点「开始对战」或浮窗的 ▶ 开始）"}
+
+
+def api_cancel_schedule():
+    with CTRL.lock:
+        if CTRL.automation_thread is not None:
+            return {"ok": False, "error": "自动化运行中；如需停止请使用停止按钮。"}
+        CTRL.schedule = {"start": None, "end": None}
+        CTRL.phase = "idle"
+        CTRL.scheduler_thread = None
+    _persist_schedule(None, None)
+    _log("SYS", "定时任务已取消。")
+    return {"ok": True, "message": "定时任务已取消"}
+
+
+def check_log_dir(path: str):
+    path = str(path or "").strip()
+    if not path:
+        return {"exists": False, "checked": False, "message": "请先输入日志目录。"}
+    p = Path(path)
+    if not p.is_dir():
+        return {"exists": False, "checked": True, "message": "目录不存在，请检查路径。"}
+    from power_log import find_latest_power_log, find_latest_session_dir
+    session = find_latest_session_dir(p)
+    plog = find_latest_power_log(p)
+    result = {
+        "exists": True,
+        "checked": True,
+        "session": session.name if session else None,
+        "power_log": str(plog) if plog else None,
+        "power_log_found": plog is not None,
+    }
+    if plog:
+        result["message"] = "✅ 找到最新对局日志 Power.log"
+    elif session:
+        result["message"] = "找到会话目录，暂无 Power.log（进行一局对战后自动生成）"
+    else:
+        result["message"] = "目录存在，但未发现炉石会话子目录（Hearthstone_时间戳 形式）"
+    return result
+
+
+def status_snapshot():
+    with CTRL.lock:
+        cfg = load_config()
+        fsm = CTRL.fsm
+        running = CTRL.automation_thread is not None
+        phase = CTRL.phase
+        if running and fsm is not None and fsm.stop_after_current_game                 and phase == "playing":
+            phase = "stopping"
+        state = fsm.FSM_state if fsm is not None else ""
+        games = int(fsm.game_count) if fsm is not None else 0
+        wins = int(fsm.win_count) if fsm is not None else 0
+        concedes = int(getattr(fsm, "concede_count", 0) or 0) if fsm is not None else 0
+        time_begin = float(getattr(fsm, "time_begin", 0.0) or 0.0)             if fsm is not None else 0.0
+        stop_after = bool(fsm.stop_after_current_game) if fsm is not None else False
+        sched = CTRL.schedule
+        start_iso = sched["start"].isoformat(timespec="minutes")             if sched.get("start") else None
+        end_iso = sched["end"].isoformat(timespec="minutes")             if sched.get("end") else None
+        err = CTRL.last_error
+        summary = CTRL.last_summary
+        stopped_by = CTRL.stopped_by
+        hotkey_ok = CTRL.hotkey_registered
+        starting = CTRL.starting
+        prepared = CTRL.prepared
+    elapsed = int(time.time() - time_begin) if time_begin > 0 else 0
+    win_rate = round(wins * 100.0 / games, 1) if games else 0.0
+    # 浮窗是否真的开着：网页用它同步「🪟 日志浮窗（开/关）」按钮文字，
+    # 也能解释「为什么大按钮回到了开始运行」。
+    try:
+        overlay_running = bool(log_overlay is not None
+                               and log_overlay.is_running())
+    except Exception:
+        overlay_running = False
+    return {
+        "server_time": datetime.now().isoformat(timespec="seconds"),
+        "is_admin": IS_ADMIN,
+        "running": running,
+        "starting": starting,
+        "prepared": prepared,
+        "overlay_running": overlay_running,
+        "phase": phase,
+        "stopped_by": stopped_by,
+        "stop_after_game": stop_after,
+        "state": state,
+        "state_label": STATE_LABELS.get(state, state or "待机"),
+        "in_game": state in ("Choosing Card", "Battling", "Quitting Battle"),
+        "games": games,
+        "wins": wins,
+        "concede_count": concedes,
+        "win_rate": win_rate,
+        "game_elapsed_sec": elapsed,
+        "schedule_start": start_iso,
+        "schedule_end": end_iso,
+        "concede": cfg.get("auto_concede") or dict(DEFAULT_AUTO_CONCEDE),
+        "concede_detect": _concede_detect_state(),
+        "rank_stop": _rank_stop_state(),
+        "human_like": _current_human_like(),
+        "liveness": {**_liveness_state(), **_current_liveness()},
+        "liveness_alert": _liveness_state().get("alert"),
+        "name_match": _name_match_state(),
+        "delays": _current_delays(),
+        "selfcheck": selfcheck_summary(),
+        "config": {"name": cfg.get("name", ""), "log_root": cfg.get("log_root", "")},
+        # 策略选择（盒子AI / 任务牧 / 鱼人萨）：网页下拉框与浮窗「本局算法」共用。
+        "strategy": {"key": strategy_setting(), "label": strategy_label(),
+                     "choices": strategy_options()},
+        "last_error": err,
+        "last_summary": summary,
+        "hotkey_ok": hotkey_ok,
+    }
+
+
+# ---------------------------------------------------------------- HTTP 服务
+class Handler(BaseHTTPRequestHandler):
+    server_version = "HSLegendArriver/1.0"
+
+    def log_message(self, fmt, *args):
+        pass  # 静默访问日志
+
+    def _json(self, payload, code=200):
+        data = json.dumps(payload, ensure_ascii=False).encode("utf8")
+        self.send_response(code)
+        self.send_header("Content-Type", "application/json; charset=utf-8")
+        self.send_header("Content-Length", str(len(data)))
+        self.send_header("Cache-Control", "no-store")
+        self.end_headers()
+        self.wfile.write(data)
+
+    def _read_json(self):
+        length = int(self.headers.get("Content-Length") or 0)
+        if length <= 0 or length > 1024 * 1024:
+            return {}
+        raw = self.rfile.read(length)
+        try:
+            return json.loads(raw.decode("utf8"))
+        except Exception:
+            raise ValueError("请求体 JSON 解析失败")
+
+    def do_GET(self):
+        try:
+            parsed = urlparse(self.path)
+            path = parsed.path
+            if path in ("/", "/index.html"):
+                html = (WEB_DIR / "index.html").read_text(encoding="utf8")
+                data = html.encode("utf8")
+                self.send_response(200)
+                self.send_header("Content-Type", "text/html; charset=utf-8")
+                self.send_header("Content-Length", str(len(data)))
+                self.send_header("Cache-Control", "no-cache")
+                self.end_headers()
+                self.wfile.write(data)
+            elif path == "/api/status":
+                self._json(status_snapshot())
+            elif path == "/api/logs":
+                q = parse_qs(parsed.query)
+                try:
+                    seq = int(q.get("seq", ["0"])[0])
+                except (TypeError, ValueError):
+                    seq = 0
+                lines, max_seq = take_logs_after(seq)
+                self._json({"seq": max_seq, "lines": lines})
+            elif path == "/api/check_log":
+                q = parse_qs(parsed.query)
+                self._json(check_log_dir(q.get("path", [""])[0]))
+            elif path == "/api/selfcheck":
+                self._json(api_selfcheck(force=False))
+            elif path == "/api/regions":
+                self._json(api_regions())
+            else:
+                self._json({"ok": False, "error": "未知接口"}, 404)
+        except Exception as exc:
+            self._json({"ok": False, "error": str(exc)}, 500)
+
+    def do_POST(self):
+        try:
+            parsed = urlparse(self.path)
+            body = {}
+            try:
+                body = self._read_json()
+            except ValueError as exc:
+                self._json({"ok": False, "error": str(exc)}, 400)
+                return
+            path = parsed.path
+            if path == "/api/config":
+                self._json(api_save_config(body))
+            elif path == "/api/start":
+                self._json(api_start(body))
+            elif path == "/api/prepare":
+                self._json(api_prepare(body))
+            elif path == "/api/stop":
+                self._json(api_stop(body))
+            elif path == "/api/schedule":
+                self._json(api_schedule(body))
+            elif path == "/api/schedule/cancel":
+                self._json(api_cancel_schedule())
+            elif path == "/api/calibrate":
+                self._json(api_calibrate())
+            elif path == "/api/overlay":
+                self._json(api_toggle_overlay(body))
+            elif path == "/api/strategy":
+                self._json(api_save_strategy(body))
+            elif path == "/api/concede":
+                self._json(api_save_concede(body))
+            elif path == "/api/rank_stop":
+                self._json(api_save_rank_stop(body))
+            elif path == "/api/human_like":
+                self._json(api_save_human_like(body))
+            elif path == "/api/liveness":
+                self._json(api_save_liveness(body))
+            elif path == "/api/delays":
+                self._json(api_save_delays(body))
+            elif path == "/api/selfcheck":
+                self._json(api_selfcheck(force=True))
+            else:
+                self._json({"ok": False, "error": "未知接口"}, 404)
+        except Exception as exc:
+            traceback.print_exc()
+            self._json({"ok": False, "error": str(exc)}, 500)
+
+
+# ---------------------------------------------------------------- 启动
+def _boot_resume_schedule():
+    cfg = load_config()
+    s, e = cfg.get("schedule_start"), cfg.get("schedule_end")
+    if not s:
+        return
+    try:
+        start_dt = datetime.fromisoformat(s)
+        end_dt = datetime.fromisoformat(e) if e else None
+    except Exception:
+        return
+    now = datetime.now()
+    if now < start_dt:
+        with CTRL.lock:
+            CTRL.schedule = {"start": start_dt, "end": end_dt}
+            CTRL.phase = "waiting"
+        t = threading.Thread(target=_schedule_worker, args=(start_dt, end_dt),
+                             name="hs-scheduler", daemon=True)
+        CTRL.scheduler_thread = t
+        t.start()
+        _log("SYS", f"恢复未完成的定时任务：{start_dt:%m-%d %H:%M} 开始。")
+    else:
+        _persist_schedule(None, None)
+        _log("WARN", "上次保存的定时任务已过期，已自动取消，请在页面重新设置。")
+
+
+def main():
+    os.chdir(ROOT)
+    # 常驻阶段监测线程：停止自动化也继续检测当前阶段（随时可恢复）
+    threading.Thread(target=_stage_monitor_loop, name="hs-stage",
+                     daemon=True).start()
+    # 常驻前台守护线程：每 30 分钟把炉石切回最前台
+    threading.Thread(target=_hearthstone_foreground_guard,
+                     name="hs-fg-guard", daemon=True).start()
+    cfg = load_config()
+    _apply_constants(cfg.get("name") or "", cfg.get("log_root") or "")
+    _boot_resume_schedule()
+    # 启动即自检：Python 版本 / 依赖包 / 分辨率和缩放（结果进日志与页面）。
+    start_selfcheck_async()
+
+    server = None
+    port = None
+    for port in range(BASE_PORT, BASE_PORT + 20):
+        try:
+            server = ThreadingHTTPServer((HOST, port), Handler)
+            break
+        except OSError:
+            continue
+    if server is None:
+        print("无法绑定端口，请检查 8765-8785 是否被占用。")
+        sys.exit(1)
+    threading.Thread(target=server.serve_forever, name="hs-web", daemon=True).start()
+
+    url = f"http://{HOST}:{port}"
+    print("=" * 64)
+    print("  HSLegendArriver Web 控制台")
+    print(f"  请在浏览器中打开: {url}")
+    if not IS_ADMIN:
+        print("  [!] 当前不是管理员权限，自动化鼠标/键盘操作可能失效，")
+    print("      建议以管理员身份重新运行本程序。")
+    print("  按 Ctrl+C 或直接关闭窗口即可退出控制台。")
+    print("=" * 64)
+    if "--no-browser" not in sys.argv:
+        threading.Timer(0.8, lambda: webbrowser.open(url)).start()
+    try:
+        while True:
+            time.sleep(3600)
+    except KeyboardInterrupt:
+        print("\n控制台已退出。")
+
+
+if __name__ == "__main__":
+    main()

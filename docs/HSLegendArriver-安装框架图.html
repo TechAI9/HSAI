@@ -1,0 +1,358 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>HSLegendArriver 安装框架图（详细版）</title>
+<style>
+:root{
+  --bg:#0e1014; --panel:#161920; --card:#1c2029; --line:rgba(255,255,255,.09);
+  --tx:#e7e9ed; --tx2:#a3a9b3; --tx3:#71777f;
+  --blue:#5b9ee0; --amber:#d99a3d; --purple:#9b8ae6; --teal:#45b39a; --green:#6fbf5f; --red:#e06c6c;
+  --mono:"Cascadia Mono",Consolas,"Courier New",monospace;
+}
+*{box-sizing:border-box}
+body{
+  margin:0;background:var(--bg);color:var(--tx);
+  font-family:-apple-system,"Segoe UI","Microsoft YaHei",system-ui,sans-serif;
+  font-size:14px;line-height:1.65;
+}
+.wrap{max-width:1080px;margin:0 auto;padding:36px 24px 72px}
+
+h1{font-size:24px;font-weight:600;margin:0 0 8px}
+.sub{color:var(--tx2);font-size:13.5px;margin:0 0 4px}
+.src{color:var(--tx3);font-size:12px;margin:0 0 26px}
+
+h2{font-size:15px;font-weight:600;margin:0 0 14px;color:var(--tx2);letter-spacing:.4px}
+
+code{font-family:var(--mono);font-size:12.5px;background:rgba(255,255,255,.07);
+  border:1px solid var(--line);border-radius:4px;padding:1px 5px;color:#cfe3f7;white-space:nowrap}
+
+/* ---------- 关键约束 ---------- */
+.limits{display:grid;grid-template-columns:repeat(auto-fit,minmax(230px,1fr));gap:10px;margin-bottom:34px}
+.limit{background:rgba(224,108,108,.07);border:1px solid rgba(224,108,108,.28);
+  border-radius:10px;padding:11px 14px}
+.limit b{display:block;font-size:13px;font-weight:600;color:#f0a3a3;margin-bottom:2px}
+.limit span{font-size:12.5px;color:var(--tx2)}
+
+/* ---------- 总览 ---------- */
+.overview{display:flex;flex-wrap:wrap;align-items:center;gap:8px;margin-bottom:34px}
+.ov{display:flex;align-items:center;gap:8px;background:var(--panel);
+  border:1px solid var(--line);border-radius:10px;padding:9px 13px}
+.ov i{width:8px;height:8px;border-radius:50%;background:var(--c);flex:none}
+.ov b{font-size:13px;font-weight:500}
+.ov em{font-size:11.5px;color:var(--tx3);font-style:normal}
+.arw{color:var(--tx3);font-size:13px;user-select:none}
+
+/* ---------- 阶段 ---------- */
+.stage{background:var(--panel);border:1px solid var(--line);border-left:3px solid var(--c);
+  border-radius:12px;padding:18px 20px 8px;margin-bottom:20px}
+.sh{display:flex;align-items:center;gap:11px;margin-bottom:4px}
+.sh .n{width:26px;height:26px;flex:none;border-radius:50%;background:var(--c);
+  color:#0e1014;font-size:13px;font-weight:700;display:flex;align-items:center;justify-content:center}
+.sh h3{font-size:16px;font-weight:600;margin:0;flex:1}
+.sh .t{font-size:12px;color:var(--tx3);white-space:nowrap}
+.sd{font-size:12.5px;color:var(--tx3);margin:0 0 6px 37px}
+
+/* ---------- 子步骤 ---------- */
+.steps{position:relative;padding-left:46px;margin-top:14px}
+.steps::before{content:"";position:absolute;left:16px;top:14px;bottom:16px;width:1px;background:var(--line)}
+.step{position:relative;background:var(--card);border:1px solid var(--line);
+  border-radius:10px;padding:12px 15px;margin-bottom:11px}
+.step::before{content:"";position:absolute;left:-35px;top:17px;width:11px;height:11px;
+  border-radius:50%;background:var(--c);box-shadow:0 0 0 3px var(--panel)}
+.act{font-size:13.5px;font-weight:600;color:var(--tx);margin-bottom:3px}
+.act u{font-family:var(--mono);font-size:11.5px;color:var(--tx3);text-decoration:none;
+  font-weight:400;margin-right:7px}
+.how{font-size:13px;color:var(--tx2)}
+.how b{color:var(--tx);font-weight:500}
+.res{font-size:12.5px;color:var(--tx2);margin-top:5px;padding-left:15px;position:relative}
+.res::before{content:"";position:absolute;left:0;top:7px;width:6px;height:6px;border-radius:2px}
+.res.ok::before{background:var(--green)}
+.res.ng::before{background:var(--red)}
+.res.wn::before{background:var(--amber)}
+.res b{font-weight:500}
+.res.ok b{color:#9ed894}.res.ng b{color:#f0a3a3}.res.wn b{color:#ecc37c}
+
+/* ---------- 表格 ---------- */
+table{width:100%;border-collapse:collapse;margin-bottom:30px;font-size:13px}
+th,td{text-align:left;padding:9px 12px;border-bottom:1px solid var(--line);vertical-align:top}
+th{font-size:12px;font-weight:600;color:var(--tx3);background:rgba(255,255,255,.03)}
+td:first-child{white-space:nowrap}
+td.k{font-family:var(--mono);font-size:12.5px;color:#cfe3f7}
+tr:last-child td{border-bottom:none}
+.tb{background:var(--panel);border:1px solid var(--line);border-radius:12px;overflow:hidden;margin-bottom:30px}
+.tb table{margin:0}
+.tb th:first-child,.tb td:first-child{padding-left:18px}
+
+/* ---------- 清单 ---------- */
+.check{list-style:none;padding:0;margin:0 0 30px}
+.check li{position:relative;padding:8px 0 8px 30px;border-bottom:1px solid var(--line);font-size:13px;color:var(--tx2)}
+.check li:last-child{border-bottom:none}
+.check li::before{content:"";position:absolute;left:0;top:13px;width:14px;height:14px;
+  border:1px solid var(--tx3);border-radius:4px}
+
+footer{border-top:1px solid var(--line);padding-top:16px;font-size:12px;color:var(--tx3)}
+
+@media print{
+  :root{--bg:#fff;--panel:#fff;--card:#fafafa;--line:#ddd;--tx:#111;--tx2:#444;--tx3:#777}
+  body{background:#fff;color:#111}
+  .stage{break-inside:avoid}
+  .step{break-inside:avoid}
+}
+</style>
+</head>
+<body>
+<div class="wrap">
+
+  <h1>HSLegendArriver 安装框架图</h1>
+  <p class="sub">Windows · Python 3.12 64 位 · 分辨率 1920×1080 · 缩放 100% · 炉石全屏 · 管理员权限启动</p>
+  <p class="src">内容整理自项目 README（github.com/magicstrangelzb/HearthstoneLegendArriver），Python 版本信息已与 python.org / PEP 693 核对。全程约 30~50 分钟，其中装依赖占大头。</p>
+
+  <h2>四条硬约束（违反任何一条都会失败）</h2>
+  <div class="limits">
+    <div class="limit"><b>Python 必须是 3.12 64 位</b><span>3.13 / 3.14 没有对应轮子，会卡在换牌、AI 识别全废</span></div>
+    <div class="limit"><b>项目路径不能有中文</b><span>统一用 <code>D:\HS</code>，含中文或空格必出问题</span></div>
+    <div class="limit"><b>1920×1080 / 缩放 100%</b><span>点击坐标是硬编码的，缩放不是 100% 会整体错位</span></div>
+    <div class="limit"><b>炉石用「全屏」不用「最大化」</b><span>最大化会让窗口客户区偏移，法术指定目标持续失败</span></div>
+  </div>
+
+  <h2>总览：五个阶段</h2>
+  <div class="overview">
+    <div class="ov" style="--c:var(--blue)"><i></i><b>下载项目</b><em>约 3 分钟</em></div>
+    <span class="arw">→</span>
+    <div class="ov" style="--c:var(--amber)"><i></i><b>安装 Python 3.12</b><em>约 5 分钟</em></div>
+    <span class="arw">→</span>
+    <div class="ov" style="--c:var(--purple)"><i></i><b>安装依赖</b><em>10~30 分钟</em></div>
+    <span class="arw">→</span>
+    <div class="ov" style="--c:var(--teal)"><i></i><b>系统与炉石设置</b><em>约 3 分钟</em></div>
+    <span class="arw">→</span>
+    <div class="ov" style="--c:var(--green)"><i></i><b>启动与自检</b><em>约 5 分钟</em></div>
+  </div>
+
+  <!-- ============ 阶段 1 ============ -->
+  <div class="stage" style="--c:var(--blue)">
+    <div class="sh"><span class="n">1</span><h3>下载项目</h3><span class="t">约 3 分钟</span></div>
+    <p class="sd">目标：在磁盘上得到一个纯粹英文路径的项目文件夹 <code>D:\HS</code></p>
+    <div class="steps">
+      <div class="step">
+        <div class="act"><u>1.1</u>打开项目主页</div>
+        <div class="how">浏览器地址栏输入 <code>github.com/magicstrangelzb/HearthstoneLegendArriver</code> → 回车</div>
+        <div class="res ok"><b>成功：</b>看到带 README 的项目主页，右上角有 Star 数</div>
+        <div class="res ng"><b>失败：</b>页面打不开 → 换个浏览器，或稍后重试（国内访问 GitHub 偶尔不稳）</div>
+      </div>
+      <div class="step">
+        <div class="act"><u>1.2</u>下载源码压缩包</div>
+        <div class="how">点右侧绿色按钮 <b>&lt;&gt; Code</b> → 下拉菜单最下面点 <b>Download ZIP</b></div>
+        <div class="res ok"><b>成功：</b>浏览器开始下载 <code>HearthstoneLegendArriver-main.zip</code></div>
+        <div class="res ng"><b>失败：</b>找不到绿色按钮 → 页面没加载完，按 <code>F5</code> 刷新</div>
+      </div>
+      <div class="step">
+        <div class="act"><u>1.3</u>找到刚下载的文件</div>
+        <div class="how">按 <code>Win + E</code> 打开文件资源管理器 → 左侧点「下载」</div>
+        <div class="res ok"><b>成功：</b>列表里能看到那个 zip 文件</div>
+      </div>
+      <div class="step">
+        <div class="act"><u>1.4</u>解压到 D 盘根目录</div>
+        <div class="how">右键 zip → <b>全部解压缩…</b> → 目标框内容改成 <code>D:\</code> → 点「提取」</div>
+        <div class="res ok"><b>成功：</b>D 盘根目录出现文件夹 <code>HearthstoneLegendArriver-main</code></div>
+        <div class="res ng"><b>失败：</b>提示路径太长 → 换成用 7-Zip 解压</div>
+      </div>
+      <div class="step">
+        <div class="act"><u>1.5</u>重命名成纯英文短路径</div>
+        <div class="how">右键该文件夹 → <b>重命名</b> → 改成 <code>HS</code> → 回车</div>
+        <div class="res ok"><b>成功：</b>最终路径就是 <code>D:\HS</code>，进去能看到 <code>requirements.txt</code>、<code>web_ui.py</code></div>
+        <div class="res wn"><b>注意：</b>千万不要放在桌面或「文档」这类中文路径下</div>
+      </div>
+    </div>
+  </div>
+
+  <!-- ============ 阶段 2 ============ -->
+  <div class="stage" style="--c:var(--amber)">
+    <div class="sh"><span class="n">2</span><h3>安装 Python 3.12</h3><span class="t">约 5 分钟</span></div>
+    <p class="sd">目标：让终端里的 <code>python --version</code> 输出 <code>Python 3.12.x</code></p>
+    <div class="steps">
+      <div class="step">
+        <div class="act"><u>2.1</u>打开 3.12 的下载页</div>
+        <div class="how">浏览器打开 <code>python.org/downloads/release/python-31210/</code></div>
+        <div class="res wn"><b>说明：</b>3.12.10 是 3.12 系列最后一个提供 Windows 安装包的版本，再往后的 3.12.11~3.12.14 只有源码，没有 exe</div>
+      </div>
+      <div class="step">
+        <div class="act"><u>2.2</u>下载 64 位安装包</div>
+        <div class="how">页面拉到最底部 <b>Files</b> 表格 → 点 <b>Windows installer (64-bit)</b>（约 25.7 MB）</div>
+        <div class="res ok"><b>成功：</b>下到 <code>python-3.12.10-amd64.exe</code></div>
+        <div class="res ng"><b>失败：</b>只看到 Source release 或 embeddable → 你进错版本页了，回到 2.1 的链接</div>
+      </div>
+      <div class="step">
+        <div class="act"><u>2.3</u>关键一步：勾上 PATH 再装</div>
+        <div class="how">双击 exe → <b>第一屏最下面勾选 <code>Add python.exe to PATH</code></b> → 点 <b>Install Now</b> → 装完点 Close</div>
+        <div class="res ok"><b>成功：</b>界面显示 Setup was successful</div>
+        <div class="res ng"><b>失败：</b>忘了勾 → 卸载重装，别手工去配环境变量（最容易配错）</div>
+      </div>
+      <div class="step">
+        <div class="act"><u>2.4</u>验证版本</div>
+        <div class="how">按 <code>Win + R</code> → 输入 <code>cmd</code> → 回车 → 输入 <code>python --version</code> → 回车</div>
+        <div class="res ok"><b>成功：</b>显示 <code>Python 3.12.10</code>，继续下一步</div>
+        <div class="res ng"><b>失败：</b>显示 3.14.x / 3.13.x，或提示「不是内部或外部命令」→ <b>先停下来</b>，说明电脑里已有别的 Python 抢了位置，把结果告诉我</div>
+      </div>
+    </div>
+  </div>
+
+  <!-- ============ 阶段 3 ============ -->
+  <div class="stage" style="--c:var(--purple)">
+    <div class="sh"><span class="n">3</span><h3>安装依赖</h3><span class="t">10~30 分钟</span></div>
+    <p class="sd">目标：把 PaddleOCR 等一大堆库装进 Python，这步最慢，中途不要关窗口</p>
+    <div class="steps">
+      <div class="step">
+        <div class="act"><u>3.1</u>进项目文件夹</div>
+        <div class="how">按 <code>Win + E</code> → 地址栏输入 <code>D:\HS</code> → 回车 → 确认能看到 <code>requirements.txt</code></div>
+      </div>
+      <div class="step">
+        <div class="act"><u>3.2</u>在这里就地打开终端</div>
+        <div class="how">点窗口顶部<b>地址栏</b>（显示 <code>D:\HS</code> 的那一条）→ 全选删掉 → 输入 <code>powershell</code> → 回车</div>
+        <div class="res ok"><b>成功：</b>弹出终端窗口，提示符是 <code>PS D:\HS&gt;</code></div>
+        <div class="res ng"><b>失败：</b>提示符不是 D:\HS → 关掉，按 3.1 重新来一遍</div>
+      </div>
+      <div class="step">
+        <div class="act"><u>3.3</u>粘贴安装命令并回车</div>
+        <div class="how"><code>pip install -r requirements.txt -i https://pypi.tuna.tsinghua.edu.cn/simple</code></div>
+        <div class="res wn"><b>注意：</b>在终端里用<b>鼠标右键</b>粘贴，<code>Ctrl+V</code> 有时候没反应</div>
+        <div class="res ng"><b>失败：</b>报 <code>pip: 无法将&amp;quot;pip&amp;quot;项识别为...</code> → 把命令开头的 <code>pip</code> 换成 <code>python -m pip</code> 再试</div>
+      </div>
+      <div class="step">
+        <div class="act"><u>3.4</u>等待 10~30 分钟</div>
+        <div class="how">屏幕会滚动大量下载进度，<b>不要关窗口、不要按 Ctrl+C</b></div>
+        <div class="res ok"><b>成功：</b>重新出现 <code>PS D:\HS&gt;</code> 提示符，且上方没有大片红色报错</div>
+        <div class="res ng"><b>失败：</b>中间有红色下载失败 → 原样重跑同一条命令，已下好的会自动跳过</div>
+      </div>
+    </div>
+  </div>
+
+  <!-- ============ 阶段 4 ============ -->
+  <div class="stage" style="--c:var(--teal)">
+    <div class="sh"><span class="n">4</span><h3>系统与炉石设置</h3><span class="t">约 3 分钟</span></div>
+    <p class="sd">目标：让屏幕和游戏画面与脚本里硬编码的坐标完全对齐</p>
+    <div class="steps">
+      <div class="step">
+        <div class="act"><u>4.1</u>改分辨率</div>
+        <div class="how">按 <code>Win + I</code> → 系统 → 屏幕 → 显示器分辨率选 <b>1920 × 1080</b></div>
+      </div>
+      <div class="step">
+        <div class="act"><u>4.2</u>改缩放</div>
+        <div class="how">同一页往下找到「缩放」→ 选 <b>100%</b></div>
+        <div class="res wn"><b>注意：</b>缩放 125% / 150% 会让所有点击整体偏移，这是最常见的「看着在跑但什么都没做」</div>
+      </div>
+      <div class="step">
+        <div class="act"><u>4.3</u>炉石改成全屏</div>
+        <div class="how">打开炉石传说 → 设置 → 选项 → 显示 → 显示模式 = <b>全屏</b></div>
+        <div class="res ng"><b>禁止：</b>不要用「最大化窗口」。窗口化时随从还能吸附成功，但法术指定目标会一直失败</div>
+      </div>
+      <div class="step">
+        <div class="act"><u>4.4</u>摆好炉石盒子</div>
+        <div class="how">打开炉石盒子（必须简体中文）→ 把左侧「推荐打法 / 打法参考A」面板留在屏幕左侧</div>
+        <div class="res wn"><b>注意：</b>面板位置要完整可见，后面阶段 5 还要用校准工具微调</div>
+      </div>
+      <div class="step">
+        <div class="act"><u>4.5</u>清场</div>
+        <div class="how">关掉可能遮挡炉石或盒子的悬浮窗、聊天软件、录屏工具</div>
+      </div>
+    </div>
+  </div>
+
+  <!-- ============ 阶段 5 ============ -->
+  <div class="stage" style="--c:var(--green)">
+    <div class="sh"><span class="n">5</span><h3>启动与自检</h3><span class="t">约 5 分钟</span></div>
+    <p class="sd">目标：网页控制台打开且环境自检全绿，然后完成校准开始对战</p>
+    <div class="steps">
+      <div class="step">
+        <div class="act"><u>5.1</u>开管理员终端</div>
+        <div class="how">按 <code>Win + X</code> → 松开 → 按 <code>A</code> → 弹窗点「是」</div>
+        <div class="res wn"><b>必须管理员：</b>否则鼠标键盘点击会被系统拦掉，现象就是「脚本在跑但点了没反应」</div>
+      </div>
+      <div class="step">
+        <div class="act"><u>5.2</u>进入项目目录</div>
+        <div class="how">输入 <code>cd D:\HS</code> → 回车</div>
+        <div class="res ng"><b>失败：</b>提示符没变化或报错 → 先输入 <code>D:</code> 回车，再输入 <code>cd HS</code> 回车</div>
+      </div>
+      <div class="step">
+        <div class="act"><u>5.3</u>启动脚本</div>
+        <div class="how">输入 <code>python web_ui.py</code> → 回车</div>
+        <div class="res ok"><b>成功：</b>终端打印本地地址，浏览器自动打开 <code>http://127.0.0.1:8765</code></div>
+        <div class="res ng"><b>失败：</b>提示 python 不是命令 → 回到阶段 2；提示缺模块 → 回到阶段 3</div>
+      </div>
+      <div class="step">
+        <div class="act"><u>5.4</u>看环境自检</div>
+        <div class="how">网页顶部「🧪 环境自检」卡片，逐项确认：Python 3.12 64 位、依赖齐全、管理员权限、分辨率/缩放、日志目录</div>
+        <div class="res ng"><b>失败：</b>只要有 ❌ 就别往下走，卡片里会直接给出修复命令</div>
+      </div>
+      <div class="step">
+        <div class="act"><u>5.5</u>填基础配置</div>
+        <div class="how">「👤 基础配置」里填 用户 ID = <b>当前战网昵称完整含 #编号</b>；再填炉石日志目录</div>
+        <div class="res ng"><b>失败：</b>换过账号没改这里 → 整局都会被判成「对手回合」，一张牌都不出，日志里还不报错</div>
+      </div>
+      <div class="step">
+        <div class="act"><u>5.6</u>先「开始运行」再校准</div>
+        <div class="how">点「🪄 开始运行」（只弹浮窗，不会开打）→ 浮窗点「校准」→ 把绿框对准盒子「打法参考A」面板 → 顶部提示条变绿</div>
+        <div class="res ok"><b>成功：</b>提示条显示「已检测到盒子面板」，按 <code>Esc</code> 收起</div>
+      </div>
+      <div class="step">
+        <div class="act"><u>5.7</u>开始对战</div>
+        <div class="how">点「⚔️ 开始对战」→ 二次确认 → 脚本开始跑</div>
+        <div class="res wn"><b>急停：</b>任何时候按 <code>Ctrl + Q</code> 立即停止</div>
+      </div>
+    </div>
+  </div>
+
+  <!-- ============ 表格 ============ -->
+  <h2>快捷键总表</h2>
+  <div class="tb">
+    <table>
+      <tr><th>按键</th><th>作用</th><th>用在哪一步</th></tr>
+      <tr><td class="k">Win + E</td><td>打开文件资源管理器</td><td>1.3 / 3.1</td></tr>
+      <tr><td class="k">Win + R</td><td>打开运行框（用来验证 Python 版本）</td><td>2.4</td></tr>
+      <tr><td class="k">Win + I</td><td>打开系统设置（改分辨率、缩放）</td><td>4.1 / 4.2</td></tr>
+      <tr><td class="k">Win + X → A</td><td>打开管理员终端（松手后再按 A）</td><td>5.1</td></tr>
+      <tr><td class="k">Ctrl + A / Ctrl + X</td><td>全选 / 剪切</td><td>1.4 / 1.5</td></tr>
+      <tr><td class="k">F5</td><td>刷新网页</td><td>1.2</td></tr>
+      <tr><td class="k">Ctrl + Q</td><td>脚本运行中立即停止</td><td>5.7</td></tr>
+    </table>
+  </div>
+
+  <h2>故障对照表</h2>
+  <div class="tb">
+    <table>
+      <tr><th>看到的现象</th><th>真正原因</th><th>怎么修</th></tr>
+      <tr><td>提示「不是内部或外部命令」</td><td>装 Python 时漏勾 Add to PATH</td><td>卸载 Python 3.12 重装，勾上那一项</td></tr>
+      <tr><td>自检显示 Python 版本 ❌</td><td>电脑里有 3.13 / 3.14 抢了 <code>python</code> 这个名字</td><td>卸载其他版本，或改 PATH 顺序后重开终端</td></tr>
+      <tr><td>脚本在跑但一张牌都不出</td><td>用户 ID 不完整，或炉石用了最大化窗口</td><td>补全 <code>#编号</code>；炉石改全屏</td></tr>
+      <tr><td>点下去完全没反应</td><td>没用管理员权限启动</td><td>用 <code>Win + X → A</code> 重新启动</td></tr>
+      <tr><td>法术一直打不出去</td><td>分辨率/缩放不对，坐标整体偏移</td><td>改回 1920×1080 + 100%</td></tr>
+      <tr><td>启动就报错、闪退</td><td>路径里含中文或空格</td><td>把项目挪到 <code>D:\HS</code></td></tr>
+      <tr><td>卡在换牌、AI 识别全废</td><td>Python 版本不是 3.12</td><td>按阶段 2 重装 3.12</td></tr>
+      <tr><td>盒子意见读不到</td><td>校准框没对准「打法参考A」面板</td><td>浮窗点「校准」，提示条变绿才算好</td></tr>
+    </table>
+  </div>
+
+  <h2>启动前最终检查清单</h2>
+  <ul class="check">
+    <li>项目路径是 <code>D:\HS</code>，纯英文、无空格、无中文</li>
+    <li><code>python --version</code> 输出 3.12.x（64 位）</li>
+    <li>依赖安装命令已跑完，终端没有红色报错</li>
+    <li>桌面分辨率 1920×1080，缩放 100%</li>
+    <li>炉石显示模式 = 全屏（不是最大化窗口）</li>
+    <li>炉石盒子为简体中文，左侧「推荐打法」完整显示</li>
+    <li>「用户 ID」填的是当前账号完整战网昵称（含 #编号）</li>
+    <li>网页「🧪 环境自检」里没有 ❌</li>
+    <li>浮窗「校准」提示条显示「已检测到盒子面板」</li>
+    <li>脚本用管理员权限启动</li>
+    <li>「🩺 存活检测」保持开启（防炉石闪退后空转）</li>
+  </ul>
+
+  <footer>
+    来源：以上安装流程整理自项目 README 原文（外部信息，非模型训练知识）；Python 3.12.10 为 3.12 系列最后一个提供 Windows 二进制安装包的版本，已与 python.org 发布页及 PEP 693 发布计划核对。<br>
+    按 Ctrl + P 可直接打印或另存为 PDF。
+  </footer>
+
+</div>
+</body>
+</html>

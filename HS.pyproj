@@ -1,0 +1,158 @@
+﻿<?xml version="1.0" encoding="utf-8"?>
+<Project ToolsVersion="4.0" xmlns="http://schemas.microsoft.com/developer/msbuild/2003" DefaultTargets="Build">
+  <PropertyGroup>
+    <Configuration Condition=" '$(Configuration)' == '' ">Debug</Configuration>
+    <SchemaVersion>2.0</SchemaVersion>
+    <ProjectGuid>{663f4f99-a685-447c-a682-dd7a659008f8}</ProjectGuid>
+    <ProjectHome />
+    <StartupFile>web_ui.py</StartupFile>
+    <SearchPath />
+    <WorkingDirectory>.</WorkingDirectory>
+    <OutputPath>.</OutputPath>
+    <ProjectTypeGuids>{888888a0-9f3d-457c-b088-3a5042f75d52}</ProjectTypeGuids>
+    <LaunchProvider>Standard Python launcher</LaunchProvider>
+    <InterpreterId />
+  </PropertyGroup>
+  <PropertyGroup Condition="'$(Configuration)' == 'Debug'" />
+  <PropertyGroup Condition="'$(Configuration)' == 'Release'" />
+  <PropertyGroup>
+    <VisualStudioVersion Condition=" '$(VisualStudioVersion)' == '' ">10.0</VisualStudioVersion>
+  </PropertyGroup>
+  <ItemGroup>
+    <Content Include="card\effects_engine.py" />
+    <Content Include="docs\game.png" />
+    <Content Include="docs\images\account-eye.png" />
+    <Content Include="docs\images\alerts.png" />
+    <Content Include="docs\images\console.png" />
+    <Content Include="docs\images\overlay.png" />
+    <Content Include="docs\images\regions.png" />
+    <Content Include="docs\images\selfcheck.png" />
+    <Content Include="docs\step1-box.png" />
+    <Content Include="docs\web.png" />
+    <Content Include="logs\对战日志_20260909_001639.txt" />
+    <Content Include="log\debug_log.txt" />
+    <Content Include="log\error_log.txt" />
+    <Content Include="log\game_state_snapshot.txt" />
+    <Content Include="log\info_log.txt" />
+    <Content Include="log\sys_log.txt" />
+    <Content Include="log\warn_log.txt" />
+    <Content Include="requirements.txt" />
+    <Content Include="ui_log_last.txt" />
+    <Content Include="web\index.html" />
+  </ItemGroup>
+  <ItemGroup>
+    <Compile Include="ai\deck_strategy.py" />
+    <Compile Include="ai\renwumu.py" />
+    <Compile Include="ai\renwumu_context.py" />
+    <Compile Include="ai\yurensa.py" />
+    <Compile Include="calibrate_roi.py" />
+    <Compile Include="card\card.py" />
+    <Compile Include="card\card_db.py" />
+    <Compile Include="click.py" />
+    <Compile Include="config.py" />
+    <Compile Include="constants\constants.py" />
+    <Compile Include="constants\__init__.py" />
+    <Compile Include="deck_strategy.py" />
+    <Compile Include="FSM_action.py" />
+    <Compile Include="get_action.py" />
+    <Compile Include="get_screen.py" />
+    <Compile Include="json_op.py" />
+    <Compile Include="log_op.py" />
+    <Compile Include="log_overlay.py" />
+    <Compile Include="log_state.py" />
+    <Compile Include="main.py" />
+    <Compile Include="manual_controller.py" />
+    <Compile Include="power_log.py" />
+    <Compile Include="print_info.py" />
+    <Compile Include="region_overlay.py" />
+    <Compile Include="screen_regions.py" />
+    <Compile Include="search\ai_action.py" />
+    <Compile Include="search\ai_state.py" />
+    <Compile Include="search\search.py" />
+    <Compile Include="selfcheck.py" />
+    <Compile Include="src\capture\desktop_capture.py" />
+    <Compile Include="src\capture\__init__.py" />
+    <Compile Include="src\flow\concede_flow.py" />
+    <Compile Include="src\flow\hand_animation_delay.py" />
+    <Compile Include="src\flow\mulligan_flow.py" />
+    <Compile Include="src\flow\recommendation_flow.py" />
+    <Compile Include="src\flow\__init__.py" />
+    <Compile Include="src\game_state\choose_one.py" />
+    <Compile Include="src\game_state\recommendation_adapter.py" />
+    <Compile Include="src\game_state\__init__.py" />
+    <Compile Include="src\ocr\paddle_adapter.py" />
+    <Compile Include="src\ocr\preprocess.py" />
+    <Compile Include="src\ocr\stable_reader.py" />
+    <Compile Include="src\ocr\__init__.py" />
+    <Compile Include="src\parser\recommendation_parser.py" />
+    <Compile Include="src\parser\__init__.py" />
+    <Compile Include="src\play_control.py" />
+    <Compile Include="src\recommendation_config.py" />
+    <Compile Include="src\recommendation_models.py" />
+    <Compile Include="src\safety\hearthstone_liveness.py" />
+    <Compile Include="src\safety\recommendation_validator.py" />
+    <Compile Include="src\safety\__init__.py" />
+    <Compile Include="src\__init__.py" />
+    <Compile Include="strategy.py" />
+    <Compile Include="strategy_entity.py" />
+    <Compile Include="tests\test_auto_concede_detection.py" />
+    <Compile Include="tests\test_choose_one.py" />
+    <Compile Include="tests\test_click_safety_checks.py" />
+    <Compile Include="tests\test_draw_extra_delay.py" />
+    <Compile Include="tests\test_draw_extra_delay_settings.py" />
+    <Compile Include="tests\test_four_option_choices.py" />
+    <Compile Include="tests\test_friendly_hand_target_battlecries.py" />
+    <Compile Include="tests\test_fsm_liveness_stop.py" />
+    <Compile Include="tests\test_full_board_magnetic.py" />
+    <Compile Include="tests\test_hand_animation_delay.py" />
+    <Compile Include="tests\test_hand_deck_actions.py" />
+    <Compile Include="tests\test_hearthstone_liveness.py" />
+    <Compile Include="tests\test_human_like.py" />
+    <Compile Include="tests\test_human_like_scope.py" />
+    <Compile Include="tests\test_legend.py" />
+    <Compile Include="tests\test_log_overlay_window.py" />
+    <Compile Include="tests\test_mouse_reset_position.py" />
+    <Compile Include="tests\test_mulligan_timing.py" />
+    <Compile Include="tests\test_ocr.py" />
+    <Compile Include="tests\test_ocr_confidence_threshold.py" />
+    <Compile Include="tests\test_overlay_eye_and_colors.py" />
+    <Compile Include="tests\test_overlay_human_like_status.py" />
+    <Compile Include="tests\test_overlay_resume_keeps_score.py" />
+    <Compile Include="tests\test_paddle_click_isolation.py" />
+    <Compile Include="tests\test_player_name_match.py" />
+    <Compile Include="tests\test_power_log_hand_entries.py" />
+    <Compile Include="tests\test_region_overlay_button.py" />
+    <Compile Include="tests\test_repeated_recommendation.py" />
+    <Compile Include="tests\test_screen_regions.py" />
+    <Compile Include="tests\test_selfcheck.py" />
+    <Compile Include="tests\test_selfcheck_collapse.py" />
+    <Compile Include="tests\test_targeted_battlecries.py" />
+    <Compile Include="tests\test_targeted_locations.py" />
+    <Compile Include="tests\test_timeline_choice.py" />
+    <Compile Include="tests\test_web_liveness_api.py" />
+    <Compile Include="tests\test_web_prepare_flow.py" />
+    <Compile Include="tests\test_web_regions_api.py" />
+    <Compile Include="tests\test_web_selfcheck_api.py" />
+    <Compile Include="web_ui.py" />
+  </ItemGroup>
+  <ItemGroup>
+    <Folder Include="constants" />
+    <Folder Include="docs" />
+    <Folder Include="docs\images" />
+    <Folder Include="log" />
+    <Folder Include="logs" />
+    <Folder Include="ai\" />
+    <Folder Include="card\" />
+    <Folder Include="search\" />
+    <Folder Include="src" />
+    <Folder Include="src\capture" />
+    <Folder Include="src\flow" />
+    <Folder Include="src\game_state" />
+    <Folder Include="src\ocr" />
+    <Folder Include="src\parser" />
+    <Folder Include="src\safety" />
+    <Folder Include="tests" />
+    <Folder Include="web" />
+  </ItemGroup>
+  <Import Project="$(MSBuildExtensionsPath32)\Microsoft\VisualStudio\v$(VisualStudioVersion)\Python Tools\Microsoft.PythonTools.targets" />
+</Project>
